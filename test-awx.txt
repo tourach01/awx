@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  aap_load_inventory_awx.sh -u https://aap.example.com -o ORG_NAME -i INVENTORY_NAME -f servers.txt [-t TOKEN | -U USER -P PASS] [-g GROUP]
+
+Options:
+  -u  URL du Controller AAP/Tower (ex: https://aap.example.com)
+  -o  Nom de l'organisation cible (ex: Default)
+  -i  Nom de l'inventaire à créer/mettre à jour
+  -f  Fichier texte contenant la liste des hôtes (un par ligne)
+  -t  Personal Access Token (Bearer)
+  -U  Nom d'utilisateur (si pas de token)
+  -P  Mot de passe (si pas de token)
+  -g  (Optionnel) Nom de groupe à créer/mettre à jour et y associer les hôtes
+
+Prérequis:
+  - awx (awxkit) et jq installés
+  - Le compte/jeton doit avoir accès à l'organisation cible
+EOF
+}
+
+URL="" ORG_NAME="" INV_NAME="" HOST_FILE=""
+TOKEN="" USER="" PASS="" GROUP=""
+
+while getopts "u:o:i:f:t:U:P:g:h" opt; do
+  case "$opt" in
+    u) URL="$OPTARG" ;;
+    o) ORG_NAME="$OPTARG" ;;
+    i) INV_NAME="$OPTARG" ;;
+    f) HOST_FILE="$OPTARG" ;;
+    t) TOKEN="$OPTARG" ;;
+    U) USER="$OPTARG" ;;
+    P) PASS="$OPTARG" ;;
+    g) GROUP="$OPTARG" ;;
+    h) usage; exit 0 ;;
+    *) usage; exit 1 ;;
+  esac
+done
+
+if [[ -z "${URL}" || -z "${ORG_NAME}" || -z "${INV_NAME}" || -z "${HOST_FILE}" ]]; then
+  usage; exit 1
+fi
+if [[ -z "${TOKEN}" && ( -z "${USER}" || -z "${PASS}" ) ]]; then
+  echo "Erreur: fournissez -t TOKEN ou bien -U USER -P PASS" >&2
+  exit 1
+fi
+if [[ ! -f "${HOST_FILE}" ]]; then
+  echo "Erreur: fichier hôtes introuvable: ${HOST_FILE}" >&2
+  exit 1
+fi
+
+# --- Authentification awx ----------------------------------------------------
+if ! command -v awx >/dev/null; then
+  echo "Erreur: 'awx' (awxkit) n'est pas installé. Exemple: pip install awxkit" >&2
+  exit 1
+fi
+if ! command -v jq >/dev/null; then
+  echo "Erreur: 'jq' n'est pas installé." >&2
+  exit 1
+fi
+
+# On initialise la config awx pour ce script (non-interactif)
+if [[ -n "${TOKEN}" ]]; then
+  awx --conf.host "${URL}" --conf.token "${TOKEN}" ping >/dev/null
+else
+  # awx login crée un token local (~/.awx/awx.cfg)
+  awx login --conf.host "${URL}" --username "${USER}" --password "${PASS}" >/dev/null
+fi
+
+# Petit helper pour extraire le premier id si présent
+first_id() { jq -r '.[0].id // empty'; }
+
+# --- 1) Récupérer l'ID de l'organisation ------------------------------------
+ORG_ID=$(awx organizations list --name "${ORG_NAME}" -f json | first_id)
+if [[ -z "${ORG_ID}" ]]; then
+  echo "Erreur: organisation '${ORG_NAME}' introuvable sur ${URL}" >&2
+  exit 1
+fi
+echo "Organisation: ${ORG_NAME} (id=${ORG_ID})"
+
+# --- 2) Récupérer/créer l'inventaire ----------------------------------------
+INV_ID=$(awx inventories list --name "${INV_NAME}" --organization "${ORG_ID}" -f json | first_id)
+if [[ -z "${INV_ID}" ]]; then
+  echo "Inventaire '${INV_NAME}' absent. Création…"
+  INV_ID=$(awx inventories create --name "${INV_NAME}" --organization "${ORG_ID}" -f json | jq -r '.id')
+  echo "Inventaire créé: id=${INV_ID}"
+else
+  echo "Inventaire trouvé: '${INV_NAME}' (id=${INV_ID})"
+fi
+
+# --- 3) (Optionnel) Récupérer/créer un groupe --------------------------------
+GROUP_ID=""
+if [[ -n "${GROUP}" ]]; then
+  GROUP_ID=$(awx groups list --inventory "${INV_ID}" --name "${GROUP}" -f json | first_id || true)
+  if [[ -z "${GROUP_ID}" ]]; then
+    echo "Groupe '${GROUP}' absent. Création…"
+    GROUP_ID=$(awx groups create --inventory "${INV_ID}" --name "${GROUP}" -f json | jq -r '.id')
+    echo "Groupe créé: id=${GROUP_ID}"
+  else
+    echo "Groupe trouvé: '${GROUP}' (id=${GROUP_ID})"
+  fi
+fi
+
+# --- 4) Ajouter les hôtes (idempotent) et associer au groupe si demandé ------
+echo "Ajout/validation des hôtes depuis: ${HOST_FILE}"
+ADDED=0 SKIPPED=0
+
+while IFS= read -r line || [[ -n "$line" ]]; do
+  host="$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+  [[ -z "${host}" || "${host}" =~ ^# ]] && continue
+
+  # Existe déjà ?
+  HID=$(awx hosts list --inventory "${INV_ID}" --name "${host}" -f json | first_id || true)
+  if [[ -z "${HID}" ]]; then
+    # Création de l'hôte (sans vars; ajoutez --variables "ansible_host: x.x.x.x" si besoin)
+    HID=$(awx hosts create --inventory "${INV_ID}" --name "${host}" -f json | jq -r '.id')
+    ((ADDED++))
+    echo "  + ${host} (id=${HID})"
+  else
+    ((SKIPPED++))
+    echo "  = ${host} (existe, id=${HID})"
+  fi
+
+  # Association au groupe si demandé
+  if [[ -n "${GROUP_ID}" ]]; then
+    awx groups associate --group "${GROUP_ID}" --host "${HID}" >/dev/null || true
+  fi
+done < "${HOST_FILE}"
+
+echo
+echo "  Inventaire : ${INV_NAME} (id=${INV_ID}) / Organisation: ${ORG_ID}"
+[[ -n "${GROUP_ID}" ]] && echo "  Groupe     : ${GROUP} (id=${GROUP_ID})"
+echo "  Hôtes      : ${ADDED} créés, ${SKIPPED} déjà présents"
