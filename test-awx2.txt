@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  aap_load_inventory_awx.sh -u https://aap.example.com -o ORG_NAME -i INVENTORY_NAME \
+    [-f servers.txt] [-H host1,host2 -H host3] \
+    [-t TOKEN | -U USER -P PASS] [-g GROUP] [-X] [-C] [-L]
+
+Obligatoire:
+  -u  URL du Controller AAP/Tower (ex: https://aap.example.com)
+  -o  Nom de l'organisation (ex: Default)
+  -i  Nom de l'inventaire
+
+Sources d'hôtes (au moins une, sauf avec -X/-C/-L):
+  -f  Fichier texte avec 1 hôte par ligne (lignes vides et # ignorées)
+  -H  Hôte(s) via CLI; utilisable plusieurs fois ou virgule-séparé
+      ex: -H web1,web2 -H db1
+
+Authentification (choisir UNE méthode):
+  -t  Personal Access Token (Bearer)
+  -U  Nom d'utilisateur (si pas de token)
+  -P  Mot de passe (si pas de token)
+
+Autres modes (mutuellement exclusifs avec l'ajout d'hôtes):
+  -g  (Optionnel) Créer/trouver un groupe et y associer les hôtes
+  -X  (Delete) Supprimer l'inventaire ciblé puis quitter
+  -C  (Check)  Vérifier existence + afficher nombre d'hôtes, puis quitter
+  -L  (List)   Lister les hôtes de l'inventaire (un par ligne), puis quitter
+
+Exemples:
+  # Ajout via fichier
+  aap_load_inventory_awx.sh -u https://aap -o Default -i MyInv -f servers.txt -t "$AAP_TOKEN"
+
+  # Ajout via CLI + groupe
+  aap_load_inventory_awx.sh -u https://aap -o Default -i MyInv -H web01,web02 -H db01 -g Web -t "$AAP_TOKEN"
+
+  # Check inventaire
+  aap_load_inventory_awx.sh -u https://aap -o Default -i MyInv -t "$AAP_TOKEN" -C
+
+  # Lister hôtes
+  aap_load_inventory_awx.sh -u https://aap -o Default -i MyInv -t "$AAP_TOKEN" -L
+
+  # Supprimer inventaire
+  aap_load_inventory_awx.sh -u https://aap -o Default -i MyInv -t "$AAP_TOKEN" -X
+EOF
+}
+
+URL="" ORG_NAME="" INV_NAME=""
+HOST_FILE=""
+TOKEN="" USER="" PASS="" GROUP=""
+DELETE_MODE="false"
+CHECK_MODE="false"
+LIST_MODE="false"
+CLI_HOSTS_RAW=()
+CLI_HOSTS=()
+
+# --- Parse options -----------------------------------------------------------
+while (( $# )); do
+  case "$1" in
+    -u) URL="${2:?}"; shift 2 ;;
+    -o) ORG_NAME="${2:?}"; shift 2 ;;
+    -i) INV_NAME="${2:?}"; shift 2 ;;
+    -f) HOST_FILE="${2:?}"; shift 2 ;;
+    -H|--host) CLI_HOSTS_RAW+=("${2:?}"); shift 2 ;;
+    -t) TOKEN="${2:?}"; shift 2 ;;
+    -U) USER="${2:?}"; shift 2 ;;
+    -P) PASS="${2:?}"; shift 2 ;;
+    -g) GROUP="${2:?}"; shift 2 ;;
+    -X|--delete) DELETE_MODE="true"; shift ;;
+    -C|--check)  CHECK_MODE="true";  shift ;;
+    -L|--list-hosts) LIST_MODE="true"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*)
+      echo "Option inconnue: $1" >&2; usage; exit 1 ;;
+    *) break ;;
+  esac
+done
+
+# --- Validations -------------------------------------------------------------
+if [[ -z "${URL}" || -z "${ORG_NAME}" || -z "${INV_NAME}" ]]; then
+  echo "Erreur: -u, -o et -i sont obligatoires." >&2
+  usage; exit 1
+fi
+if [[ -z "${TOKEN}" && ( -z "${USER}" || -z "${PASS}" ) ]]; then
+  echo "Erreur: fournissez -t TOKEN ou bien -U USER -P PASS." >&2
+  exit 1
+fi
+
+# Normaliser les -H (split virgules, trim)
+if ((${#CLI_HOSTS_RAW[@]})); then
+  IFS_SAVE=$IFS; IFS=,
+  for chunk in "${CLI_HOSTS_RAW[@]}"; do
+    for h in $chunk; do
+      h="$(printf '%s' "$h" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+      [[ -n "$h" ]] && CLI_HOSTS+=("$h")
+    done
+  done
+  IFS=$IFS_SAVE
+fi
+
+# Si pas delete/check/list, il faut des hôtes (-f ou -H)
+if [[ "${DELETE_MODE}" != "true" && "${CHECK_MODE}" != "true" && "${LIST_MODE}" != "true" ]]; then
+  if [[ -z "${HOST_FILE}" && ${#CLI_HOSTS[@]} -eq 0 ]]; then
+    echo "Erreur: spécifiez au moins -f ou -H (sauf avec -X/-C/-L)." >&2
+    usage; exit 1
+  fi
+  if [[ -n "${HOST_FILE}" && ! -f "${HOST_FILE}" ]]; then
+    echo "Erreur: fichier hôtes introuvable: ${HOST_FILE}" >&2
+    exit 1
+  fi
+fi
+
+# --- Prérequis ---------------------------------------------------------------
+command -v awx >/dev/null || { echo "Erreur: 'awx' (awxkit) non trouvé (pip install awxkit)"; exit 1; }
+command -v jq  >/dev/null || { echo "Erreur: 'jq' non trouvé"; exit 1; }
+
+# --- Auth AWX ---------------------------------------------------------------
+if [[ -n "${TOKEN}" ]]; then
+  awx --conf.host "${URL}" --conf.token "${TOKEN}" --conf.color False ping >/dev/null
+else
+  awx login --conf.host "${URL}" --username "${USER}" --password "${PASS}" >/dev/null
+fi
+
+# Forcer pas de pager/couleur et couper stdin aux commandes awx
+export AWX_CLI_NOPAGER=1
+export AWX_CLI_NOCOLOR=1
+
+# --- Helpers jq robustes -----------------------------------------------------
+first_id() {
+  jq -r '
+    if type=="array" and length>0 then
+      .[0].id // empty
+    elif type=="object" and has("results") and (.results|type=="array") and ((.results|length)>0) then
+      .results[0].id // empty
+    elif type=="object" and has("id") then
+      .id // empty
+    else empty end
+  '
+}
+count_items() {
+  jq -r '
+    if type=="array" then length
+    elif type=="object" and has("count") then .count
+    elif type=="object" and has("results") and (.results|type=="array") then (.results|length)
+    else 0 end
+  '
+}
+list_names() {
+  jq -r '
+    if type=="array" then .[]?.name
+    elif type=="object" and has("results") then .results[]?.name
+    else empty end
+  '
+}
+
+# --- 1) ORG ------------------------------------------------------------------
+ORG_ID=$(awx organizations list --name "${ORG_NAME}" -f json --conf.color False </dev/null | first_id)
+if [[ -z "${ORG_ID}" ]]; then
+  echo "Erreur: organisation '${ORG_NAME}' introuvable sur ${URL}" >&2
+  exit 1
+fi
+echo "Organisation: ${ORG_NAME} (id=${ORG_ID})"
+
+# --- 2) INVENTORY lookup -----------------------------------------------------
+INV_ID=$(awx inventories list --name "${INV_NAME}" --organization "${ORG_ID}" -f json --conf.color False </dev/null | first_id || true)
+
+# --- Mode LIST ---------------------------------------------------------------
+if [[ "${LIST_MODE}" == "true" ]]; then
+  if [[ -z "${INV_ID}" ]]; then
+    echo "Inventaire '${INV_NAME}' introuvable (org=${ORG_NAME})." >&2
+    exit 2
+  fi
+  echo "Hôtes de l'inventaire '${INV_NAME}' (id=${INV_ID}):"
+  awx hosts list --inventory "${INV_ID}" -f json --conf.color False </dev/null | list_names
+  exit 0
+fi
+
+# --- Mode CHECK --------------------------------------------------------------
+if [[ "${CHECK_MODE}" == "true" ]]; then
+  if [[ -z "${INV_ID}" ]]; then
+    echo "Inventaire '${INV_NAME}' introuvable (org=${ORG_NAME})."
+    exit 2
+  fi
+  HOSTS_JSON=$(awx hosts list --inventory "${INV_ID}" -f json --conf.color False </dev/null)
+  HOSTS_COUNT=$(printf '%s' "${HOSTS_JSON}" | count_items)
+  echo "Inventaire '${INV_NAME}' existe (id=${INV_ID})."
+  echo "Nombre d'hôtes: ${HOSTS_COUNT}"
+  exit 0
+fi
+
+# --- Mode DELETE -------------------------------------------------------------
+if [[ "${DELETE_MODE}" == "true" ]]; then
+  if [[ -z "${INV_ID}" ]]; then
+    echo "Inventaire '${INV_NAME}' introuvable (org=${ORG_NAME}). Rien à supprimer."
+    exit 0
+  fi
+  echo "Suppression de l'inventaire '${INV_NAME}' (id=${INV_ID})…"
+  if ! awx inventories delete "${INV_ID}" --conf.color False </dev/null; then
+    echo "Échec de suppression (inventaire peut être référencé par d'autres objets)." >&2
+    exit 1
+  fi
+  echo "Inventaire supprimé."
+  exit 0
+fi
+
+# --- 3) INVENTORY create si absent ------------------------------------------
+if [[ -z "${INV_ID}" ]]; then
+  echo "Inventaire '${INV_NAME}' absent. Création…"
+  INV_ID=$(awx inventories create --name "${INV_NAME}" --organization "${ORG_ID}" -f json --conf.color False </dev/null | jq -r '.id // empty')
+  if [[ -z "${INV_ID}" ]]; then
+    echo "Échec de création de l'inventaire." >&2
+    exit 1
+  fi
+  echo "Inventaire créé: id=${INV_ID}"
+else
+  echo "Inventaire trouvé: '${INV_NAME}' (id=${INV_ID})"
+fi
+
+# --- 4) GROUP (optionnel) ----------------------------------------------------
+GROUP_ID=""
+if [[ -n "${GROUP}" ]]; then
+  GROUP_ID=$(awx groups list --inventory "${INV_ID}" --name "${GROUP}" -f json --conf.color False </dev/null | first_id || true)
+  if [[ -z "${GROUP_ID}" ]]; then
+    echo "Groupe '${GROUP}' absent. Création…"
+    GROUP_ID=$(awx groups create --inventory "${INV_ID}" --name "${GROUP}" -f json --conf.color False </dev/null | jq -r '.id // empty')
+    if [[ -z "${GROUP_ID}" ]]; then
+      echo "Échec de création du groupe." >&2
+      exit 1
+    fi
+    echo "Groupe créé: id=${GROUP_ID}"
+  else
+    echo "Groupe trouvé: '${GROUP}' (id=${GROUP_ID})"
+  fi
+fi
+
+# --- 5) Fusionner hosts (fichier + -H), dédoublonner -------------------------
+declare -A SEEN=()
+FINAL_HOSTS=()
+
+if [[ -n "${HOST_FILE}" ]]; then
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    h="$(printf '%s' "$line" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [[ -z "$h" || "$h" =~ ^# ]] && continue
+    if [[ -z "${SEEN[$h]+x}" ]]; then SEEN["$h"]=1; FINAL_HOSTS+=("$h"); fi
+  done < "${HOST_FILE}"
+fi
+for h in "${CLI_HOSTS[@]}"; do
+  if [[ -z "${SEEN[$h]+x}" ]]; then SEEN["$h"]=1; FINAL_HOSTS+=("$h"); fi
+done
+
+if ((${#FINAL_HOSTS[@]}==0)); then
+  echo "Aucun hôte à traiter après fusion -f / -H." >&2
+  exit 0
+fi
+
+# --- 6) Ajout idempotent + association groupe --------------------------------
+echo "Ajout/validation des hôtes (${#FINAL_HOSTS[@]})…"
+ADDED=0 SKIPPED=0
+
+for host in "${FINAL_HOSTS[@]}"; do
+  HID=$(awx hosts list --inventory "${INV_ID}" --name "${host}" -f json --conf.color False </dev/null | first_id || true)
+  if [[ -z "${HID}" ]]; then
+    # Ajoutez --variables "ansible_host: x.x.x.x" si besoin
+    HID=$(awx hosts create --inventory "${INV_ID}" --name "${host}" -f json --conf.color False </dev/null | jq -r '.id // empty' || true)
+    if [[ -z "${HID}" ]]; then
+      echo "  ! Échec création hôte '${host}'" >&2
+      continue
+    fi
+    ((ADDED++))
+    echo "  + ${host} (id=${HID})"
+  else
+    ((SKIPPED++))
+    echo "  = ${host} (existe, id=${HID})"
+  fi
+
+  if [[ -n "${GROUP_ID}" ]]; then
+    awx groups associate --group "${GROUP_ID}" --host "${HID}" --conf.color False </dev/null >/dev/null 2>&1 || true
+  fi
+done
+
+echo
+echo "Résumé:"
+echo "  Inventaire : ${INV_NAME} (id=${INV_ID}) / Organisation: ${ORG_NAME} (id=${ORG_ID})"
+[[ -n "${GROUP_ID}" ]] && echo "  Groupe     : ${GROUP} (id=${GROUP_ID})"
+echo "  Hôtes      : ${ADDED} créés, ${SKIPPED} déjà présents"
