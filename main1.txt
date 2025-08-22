@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# --- Localiser & sourcer les fonctions --------------------------------------
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+HELPERS="${SCRIPT_DIR}/aap_helpers.sh"
+if [[ ! -f "${HELPERS}" ]]; then
+  echo "Helpers introuvables: ${HELPERS}" >&2
+  exit 1
+fi
+# shellcheck source=./aap_helpers.sh
+source "${HELPERS}"
+
+# ... (usage, parse options, validations, auth, etc.)
+
+# Exemple d’utilisation des fonctions “pures”
+# ORG_ID, INV_ID obtenus comme avant.
+
+# Purge inventaire (option -P/--purge-inventory)
+if [[ -n "${PURGE_ONLY_NAME}" ]]; then
+  DEST_INV_ID=$(awx inventories list --name "${PURGE_ONLY_NAME}" --organization "${ORG_ID}" -f json --conf.color False </dev/null | first_id || true)
+  [[ -z "${DEST_INV_ID}" ]] && { echo "Inventaire '${PURGE_ONLY_NAME}' introuvable."; exit 2; }
+  purge_inventory_hosts "${DEST_INV_ID}"
+  exit 0
+fi
+
+# Build-from-failed (option -B)
+if [[ -n "${BUILD_FROM_FAILED}" ]]; then
+  [[ -z "${INV_ID}" ]] && { echo "-B nécessite un inventaire source via -i."; exit 1; }
+  mapfile -t FAILED_HOSTS < <(failed_host_names_from_inventory "${INV_ID}" | sort -u)
+  [[ ${#FAILED_HOSTS[@]} -eq 0 ]] && { echo "Aucun failed-host détecté."; exit 0; }
+
+  DEST_INV_ID=$(awx inventories list --name "${BUILD_FROM_FAILED}" --organization "${ORG_ID}" -f json --conf.color False </dev/null | first_id || true)
+  [[ -z "${DEST_INV_ID}" ]] && DEST_INV_ID=$(create_inventory "${ORG_ID}" "${BUILD_FROM_FAILED}")
+  [[ -z "${DEST_INV_ID}" ]] && { echo "Échec création inventaire dest."; exit 1; }
+
+  [[ "${PURGE_DEST}" == "true" ]] && purge_inventory_hosts "${DEST_INV_ID}"
+
+  DEST_GROUP_ID=""
+  [[ -n "${GROUP}" ]] && DEST_GROUP_ID=$(ensure_group "${DEST_INV_ID}" "${GROUP}")
+
+  echo "Ajout de ${#FAILED_HOSTS[@]} failed-host(s) dans '${BUILD_FROM_FAILED}'…"
+  add_hosts_into_inventory "${DEST_INV_ID}" "${DEST_GROUP_ID}" "${FAILED_HOSTS[@]}"
+  exit 0
+fi
+
+# Lancement template (option -T)
+if [[ -n "${TEMPLATE_ARG}" ]]; then
+  if [[ -n "${INV_NAME}" ]]; then
+    [[ -z "${INV_ID}" ]] && { echo "Inventaire '${INV_NAME}' introuvable."; exit 2; }
+    # Optionnel: ajouter des hôtes avant le run
+    GROUP_ID=""
+    [[ -n "${GROUP}" ]] && GROUP_ID=$(ensure_group "${INV_ID}" "${GROUP}")
+    # construire liste finale d'hôtes depuis -f/-H si besoin
+    FINAL_HOSTS=()
+    if [[ -n "${HOST_FILE}" ]]; then
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%[$'\r\n']}"
+        [[ -z "$line" || "$line" =~ ^# ]] && continue
+        FINAL_HOSTS+=("$line")
+      done < "${HOST_FILE}"
+    fi
+    if ((${#CLI_HOSTS[@]})); then FINAL_HOSTS+=("${CLI_HOSTS[@]}"); fi
+    if ((${#FINAL_HOSTS[@]})); then
+      add_hosts_into_inventory "${INV_ID}" "${GROUP_ID}" "${FINAL_HOSTS[@]}"
+    fi
+
+    launch_template_with_inventory \
+      "${TEMPLATE_ARG}" "${INV_ID}" \
+      "${EXTRA_VARS}" "${SHOW_FAILED}" \
+      "${FAILED_DEST_NAME}" "${PURGE_DEST}" \
+      "${ORG_ID}" "${GROUP}"
+    exit $?
+  else
+    # inventaire temporaire
+    TS=$(date +%Y%m%d-%H%M%S)
+    TEMP_INV_NAME="TMP-${TEMPLATE_ARG// /_}-${TS}"
+    TEMP_INV_ID=$(create_inventory "${ORG_ID}" "${TEMP_INV_NAME}") || true
+    [[ -z "${TEMP_INV_ID}" ]] && { echo "Échec création inventaire temporaire."; exit 1; }
+
+    TEMP_GROUP_ID=""
+    [[ -n "${GROUP}" ]] && TEMP_GROUP_ID=$(ensure_group "${TEMP_INV_ID}" "${GROUP}")
+
+    FINAL_HOSTS=()
+    if [[ -n "${HOST_FILE}" ]]; then
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%[$'\r\n']}"
+        [[ -z "$line" || "$line" =~ ^# ]] && continue
+        FINAL_HOSTS+=("$line")
+      done < "${HOST_FILE}"
+    fi
+    if ((${#CLI_HOSTS[@]})); then FINAL_HOSTS+=("${CLI_HOSTS[@]}"); fi
+    if ((${#FINAL_HOSTS[@]})); then
+      add_hosts_into_inventory "${TEMP_INV_ID}" "${TEMP_GROUP_ID}" "${FINAL_HOSTS[@]}"
+    fi
+
+    JOB_OK=0
+    if ! launch_template_with_inventory \
+          "${TEMPLATE_ARG}" "${TEMP_INV_ID}" \
+          "${EXTRA_VARS}" "${SHOW_FAILED}" \
+          "${FAILED_DEST_NAME}" "${PURGE_DEST}" \
+          "${ORG_ID}" "${GROUP}"; then
+      JOB_OK=1
+    fi
+
+    awx inventories delete "${TEMP_INV_ID}" --conf.color False </dev/null || true
+    exit ${JOB_OK}
+  fi
+fi
+
+# (… reste du chemin “gestion d’inventaire”: create/ensure + add hosts …)
