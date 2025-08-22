@@ -1,0 +1,580 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  aap_load_inventory_awx.sh -u https://aap.example.com -o ORG_NAME [-i INVENTORY_NAME] \
+    [-f servers.txt] [-H host1,host2 -H host3] \
+    [-t TOKEN | -U USER -P PASS] [-g GROUP] \
+    [-X] [-C] [-L] \
+    [-T TEMPLATE_NAME_OR_ID] [-E "k=v ..."|@file.yml] [-F] [-D FAILED_DEST_NAME [--purge-dest]] \
+    [-B NEW_INV_FROM_FAILED [--purge-dest]] \
+    [-P INVENTORY_TO_PURGE]
+
+Obligatoire:
+  -u  URL du Controller AAP/Tower (ex: https://aap.example.com)
+  -o  Nom de l'organisation (ex: Default)
+
+Inventaire:
+  -i  Nom de l'inventaire (si absent et -T, un inventaire temporaire est créé)
+  -g  (Optionnel) Créer/trouver un groupe et y associer les hôtes ajoutés
+  -f  Fichier texte (un hôte par ligne) à ajouter
+  -H  Hôte(s) via CLI; utilisable plusieurs fois ou virgule-séparé (ex: -H web1,web2 -H db1)
+
+Authentification (choisir UNE méthode):
+  -t  Personal Access Token (Bearer)
+  -U  Nom d'utilisateur (si pas de token)
+  -P  Mot de passe (si pas de token)
+
+Modes spéciaux:
+  -X, --delete             Supprimer l'inventaire ciblé (-i) puis quitter
+  -C, --check              Vérifier existence (-i) + afficher nombre d'hôtes, puis quitter
+  -L, --list-hosts         Lister les hôtes de l'inventaire (-i), puis quitter
+
+  -T, --template NAME|ID   Lancer le Job Template (par nom ou id).
+                           Si -i absent, crée un inventaire temporaire, ajoute -f/-H si fournis,
+                           lance, attend la fin, puis supprime l'inventaire temporaire.
+  -E, --extra-vars EVARS   Extra-vars pour le lancement du template (ex: -E "env=prod ver=1.2.3" ou -E @vars.yml)
+  -F, --failed-hosts       Après -T, afficher la liste des hôtes en échec (job_host_summaries)
+  -D, --failed-dest NAME   Après -T, créer/compléter l'inventaire NAME avec les failed-hosts du job
+                           (fonctionne avec --purge-dest et -g)
+
+  -B, --build-from-failed NAME
+                           Créer/compléter l'inventaire NAME avec les failed-hosts de l'inventaire source (-i requis)
+                           Option: --purge-dest pour vider l'inventaire NAME avant remplissage
+
+  -P, --purge-inventory NAME
+                           Purger (vider) l'inventaire NAME (supprimer tous ses hôtes) puis quitter
+
+Options communes:
+  --purge-dest             À utiliser avec -B ou -D: vide l'inventaire destination avant remplissage
+
+Exemples:
+  # Lancer un template sur un inventaire existant + extra-vars
+  aap_load_inventory_awx.sh -u https://aap -o Default -i MyInv -T "Deploy App" -t "$AAP_TOKEN" -E "env=staging version=1.2.3"
+
+  # Lancer un template sans inventaire: inventaire temporaire nourri via fichier, afficher failed-hosts, et les stocker dans Failed-PRD (purge préalable)
+  aap_load_inventory_awx.sh -u https://aap -o Default -f servers.txt -T "SmokeTest" -t "$AAP_TOKEN" -F -D "Failed-PRD" --purge-dest
+
+  # Construire un inventaire Failed-PRD à partir des failed-hosts d'un inventaire source
+  aap_load_inventory_awx.sh -u https://aap -o Default -i "Prod-Inventory" -B "Failed-PRD" -t "$AAP_TOKEN" --purge-dest
+
+  # Purger un inventaire donné
+  aap_load_inventory_awx.sh -u https://aap -o Default -P "SandboxInv" -t "$AAP_TOKEN"
+EOF
+}
+
+URL="" ORG_NAME="" INV_NAME=""
+HOST_FILE=""
+TOKEN="" USER="" PASS="" GROUP=""
+DELETE_MODE="false"
+CHECK_MODE="false"
+LIST_MODE="false"
+TEMPLATE_ARG=""
+EXTRA_VARS=""
+SHOW_FAILED="false"
+FAILED_DEST_NAME=""
+BUILD_FROM_FAILED=""
+PURGE_DEST="false"
+PURGE_ONLY_NAME=""
+CLI_HOSTS_RAW=()
+CLI_HOSTS=()
+
+# --- Parse options -----------------------------------------------------------
+while (( $# )); do
+  case "$1" in
+    -u) URL="${2:?}"; shift 2 ;;
+    -o) ORG_NAME="${2:?}"; shift 2 ;;
+    -i) INV_NAME="${2:?}"; shift 2 ;;
+    -f) HOST_FILE="${2:?}"; shift 2 ;;
+    -H|--host) CLI_HOSTS_RAW+=("${2:?}"); shift 2 ;;
+    -t) TOKEN="${2:?}"; shift 2 ;;
+    -U) USER="${2:?}"; shift 2 ;;
+    -P) PASS="${2:?}"; shift 2 ;;
+    -g) GROUP="${2:?}"; shift 2 ;;
+    -X|--delete) DELETE_MODE="true"; shift ;;
+    -C|--check)  CHECK_MODE="true";  shift ;;
+    -L|--list-hosts) LIST_MODE="true"; shift ;;
+    -T|--template) TEMPLATE_ARG="${2:?}"; shift 2 ;;
+    -E|--extra-vars) EXTRA_VARS="${2:?}"; shift 2 ;;
+    -F|--failed-hosts) SHOW_FAILED="true"; shift ;;
+    -D|--failed-dest) FAILED_DEST_NAME="${2:?}"; shift 2 ;;
+    -B|--build-from-failed) BUILD_FROM_FAILED="${2:?}"; shift 2 ;;
+    --purge-dest) PURGE_DEST="true"; shift ;;
+    -P|--purge-inventory) PURGE_ONLY_NAME="${2:?}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*)
+      echo "Option inconnue: $1" >&2; usage; exit 1 ;;
+    *) break ;;
+  esac
+done
+
+# --- Validations -------------------------------------------------------------
+if [[ -z "${URL}" || -z "${ORG_NAME}" ]]; then
+  echo "Erreur: -u et -o sont obligatoires." >&2
+  usage; exit 1
+fi
+if [[ -z "${TOKEN}" && ( -z "${USER}" || -z "${PASS}" ) ]]; then
+  echo "Erreur: fournissez -t TOKEN ou bien -U USER -P PASS." >&2
+  exit 1
+fi
+
+# Normaliser -H
+if ((${#CLI_HOSTS_RAW[@]})); then
+  IFS_SAVE=$IFS; IFS=,
+  for chunk in "${CLI_HOSTS_RAW[@]}"; do
+    for h in $chunk; do
+      h="$(printf '%s' "$h" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+      [[ -n "$h" ]] && CLI_HOSTS+=("$h")
+    done
+  done
+  IFS=$IFS_SAVE
+fi
+
+# Si hors modes spéciaux, on exige -i et au moins -f/-H
+if [[ "${DELETE_MODE}" != "true" && "${CHECK_MODE}" != "true" && "${LIST_MODE}" != "true" && -z "${TEMPLATE_ARG}" && -z "${BUILD_FROM_FAILED}" && -z "${PURGE_ONLY_NAME}" ]]; then
+  if [[ -z "${INV_NAME}" ]]; then
+    echo "Erreur: sans -T/-X/-C/-L/-B/-P, vous devez préciser -i INVENTORY_NAME." >&2
+    usage; exit 1
+  fi
+  if [[ -z "${HOST_FILE}" && ${#CLI_HOSTS[@]} -eq 0 ]]; then
+    echo "Erreur: sans -T/-X/-C/-L/-B/-P, spécifiez au moins -f ou -H pour ajouter des hôtes." >&2
+    usage; exit 1
+  fi
+  if [[ -n "${HOST_FILE}" && ! -f "${HOST_FILE}" ]]; then
+    echo "Erreur: fichier hôtes introuvable: ${HOST_FILE}" >&2
+    exit 1
+  fi
+fi
+
+# --- Prérequis ---------------------------------------------------------------
+command -v awx >/dev/null || { echo "Erreur: 'awx' (awxkit) non trouvé (pip install awxkit)"; exit 1; }
+command -v jq  >/dev/null || { echo "Erreur: 'jq' non trouvé"; exit 1; }
+
+# --- Auth AWX ---------------------------------------------------------------
+if [[ -n "${TOKEN}" ]]; then
+  awx --conf.host "${URL}" --conf.token "${TOKEN}" --conf.color False ping >/dev/null
+else
+  awx login --conf.host "${URL}" --username "${USER}" --password "${PASS}" >/dev/null
+fi
+export AWX_CLI_NOPAGER=1
+export AWX_CLI_NOCOLOR=1
+
+# --- Helpers jq robustes -----------------------------------------------------
+first_id() {
+  jq -r '
+    if type=="array" and length>0 then
+      .[0].id // empty
+    elif type=="object" and has("results") and (.results|type=="array") and ((.results|length)>0) then
+      .results[0].id // empty
+    elif type=="object" and has("id") then
+      .id // empty
+    else empty end
+  '
+}
+count_items() {
+  jq -r '
+    if type=="array" then length
+    elif type=="object" and has("count") then .count
+    elif type=="object" and has("results") and (.results|type=="array") then (.results|length)
+    else 0 end
+  '
+}
+list_names() {
+  jq -r '
+    if type=="array" then .[]?.name
+    elif type=="object" and has("results") then .results[]?.name
+    else empty end
+  '
+}
+
+# --- Utils inventaire/groupe/hosts ------------------------------------------
+create_inventory() {
+  local name="$1"
+  awx inventories create --name "${name}" --organization "${ORG_ID}" -f json --conf.color False </dev/null | jq -r '.id // empty'
+}
+ensure_group() {
+  local inv_id="$1" group_name="$2"
+  local gid
+  gid=$(awx groups list --inventory "${inv_id}" --name "${group_name}" -f json --conf.color False </dev/null | first_id || true)
+  if [[ -z "${gid}" ]]; then
+    echo "Groupe '${group_name}' absent. Création…"
+    gid=$(awx groups create --inventory "${inv_id}" --name "${group_name}" -f json --conf.color False </dev/null | jq -r '.id // empty')
+    if [[ -z "${gid}" ]]; then
+      echo "Échec de création du groupe." >&2
+      exit 1
+    fi
+  fi
+  echo "${gid}"
+}
+first_or_create_host() {
+  local inv_id="$1" host="$2"
+  local hid
+  hid=$(awx hosts list --inventory "${inv_id}" --name "${host}" -f json --conf.color False </dev/null | first_id || true)
+  if [[ -z "${hid}" ]]; then
+    hid=$(awx hosts create --inventory "${inv_id}" --name "${host}" -f json --conf.color False </dev/null | jq -r '.id // empty' || true)
+  fi
+  printf '%s' "${hid}"
+}
+add_hosts_into_inventory() {
+  local inv_id="$1" group_id="${2:-}"
+  declare -A SEEN=()
+  local FINAL_HOSTS=()
+
+  if [[ -n "${HOST_FILE}" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      h="$(printf '%s' "$line" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+      [[ -z "$h" || "$h" =~ ^# ]] && continue
+      [[ -z "${SEEN[$h]+x}" ]] && SEEN["$h"]=1 && FINAL_HOSTS+=("$h")
+    done < "${HOST_FILE}"
+  fi
+  for h in "${CLI_HOSTS[@]}"; do
+    [[ -z "${SEEN[$h]+x}" ]] && SEEN["$h"]=1 && FINAL_HOSTS+=("$h")
+  done
+
+  if ((${#FINAL_HOSTS[@]}==0)); then
+    echo "Aucun hôte à ajouter."
+    return
+  fi
+
+  echo "Ajout/validation des hôtes (${#FINAL_HOSTS[@]})…"
+  for host in "${FINAL_HOSTS[@]}"; do
+    HID=$(first_or_create_host "${inv_id}" "${host}")
+    if [[ -z "${HID}" ]]; then
+      echo "  ! Échec création hôte '${host}'" >&2
+      continue
+    fi
+    echo "  = ${host} (id=${HID})"
+    if [[ -n "${group_id}" ]]; then
+      awx groups associate --group "${group_id}" --host "${HID}" --conf.color False </dev/null >/dev/null 2>&1 || true
+    fi
+  done
+}
+
+purge_inventory_hosts() {
+  # $1 = inventory_id
+  echo "Purge des hôtes de l'inventaire id=${1}…"
+  local page=1
+  local deleted=0
+  while :; do
+    local json ids
+    json=$(awx hosts list --inventory "$1" --page "${page}" -f json --conf.color False </dev/null)
+    ids=$(printf '%s' "${json}" | jq -r '
+      if type=="array" then .[]
+      elif type=="object" and has("results") then .results[]
+      else empty end
+      | .id')
+    [[ -z "${ids}" ]] && break
+    while IFS= read -r hid; do
+      [[ -z "${hid}" ]] && continue
+      awx hosts delete "${hid}" --conf.color False </dev/null || true
+      ((deleted++))
+    done <<< "${ids}"
+    # next?
+    local has_next
+    has_next=$(printf '%s' "${json}" | jq -r 'if type=="object" and has("next") then (.next!=null) else "false" end')
+    [[ "${has_next}" == "true" ]] || break
+    ((page++))
+  done
+  echo "Purge terminée: ${deleted} hôte(s) supprimé(s)."
+}
+
+# --- Failed hosts helpers ----------------------------------------------------
+failed_host_names_from_inventory() {
+  # $1 = inventory_id
+  awx hosts list --inventory "$1" -f json --conf.color False </dev/null \
+  | jq -r '
+      if type=="array" then .[]
+      elif type=="object" and has("results") then .results[]
+      else empty end
+      | select(.has_active_failures==true)
+      | .name
+    '
+}
+collect_failed_hosts_from_job() {
+  # $1 = job_id
+  local page=1
+  while :; do
+    local json
+    json=$(awx job_host_summaries list --job "$1" --page "${page}" -f json --conf.color False </dev/null)
+    printf '%s' "${json}" | jq -r '
+      if type=="array" then .[]
+      elif type=="object" and has("results") then .results[]
+      else empty end
+      | select((.failed==true) or (.status=="failed") or (.failed==1))
+      | .host_name'
+    local has_next
+    has_next=$(printf '%s' "${json}" | jq -r 'if type=="object" and has("next") then (.next!=null) else "false" end')
+    [[ "${has_next}" == "true" ]] || break
+    ((page++))
+  done
+}
+
+print_failed_hosts() {
+  local job_id="$1"
+  local names
+  names=$(collect_failed_hosts_from_job "${job_id}" | sort -u)
+  if [[ -n "${names}" ]]; then
+    printf '%s\n' "${names}"
+  else
+    echo "(aucun hôte en échec)"
+  fi
+}
+
+# --- 1) ORG ------------------------------------------------------------------
+ORG_ID=$(awx organizations list --name "${ORG_NAME}" -f json --conf.color False </dev/null | first_id)
+if [[ -z "${ORG_ID}" ]]; then
+  echo "Erreur: organisation '${ORG_NAME}' introuvable sur ${URL}" >&2
+  exit 1
+fi
+echo "Organisation: ${ORG_NAME} (id=${ORG_ID})"
+
+# --- 2) INVENTORY lookup -----------------------------------------------------
+INV_ID=""
+if [[ -n "${INV_NAME}" ]]; then
+  INV_ID=$(awx inventories list --name "${INV_NAME}" --organization "${ORG_ID}" -f json --conf.color False </dev/null | first_id || true)
+fi
+
+# --- Mode PURGE INVENTORY ----------------------------------------------------
+if [[ -n "${PURGE_ONLY_NAME}" ]]; then
+  DEST_INV_ID=$(awx inventories list --name "${PURGE_ONLY_NAME}" --organization "${ORG_ID}" -f json --conf.color False </dev/null | first_id || true)
+  if [[ -z "${DEST_INV_ID}" ]]; then
+    echo "Inventaire '${PURGE_ONLY_NAME}' introuvable (org=${ORG_NAME})." >&2
+    exit 2
+  fi
+  purge_inventory_hosts "${DEST_INV_ID}"
+  exit 0
+fi
+
+# --- Modes LIST/CHECK/DELETE -------------------------------------------------
+if [[ "${LIST_MODE}" == "true" ]]; then
+  if [[ -z "${INV_ID}" ]]; then
+    echo "Inventaire '${INV_NAME}' introuvable (org=${ORG_NAME})." >&2
+    exit 2
+  fi
+  echo "Hôtes de l'inventaire '${INV_NAME}' (id=${INV_ID}):"
+  awx hosts list --inventory "${INV_ID}" -f json --conf.color False </dev/null | list_names
+  exit 0
+fi
+
+if [[ "${CHECK_MODE}" == "true" ]]; then
+  if [[ -z "${INV_ID}" ]]; then
+    echo "Inventaire '${INV_NAME}' introuvable (org=${ORG_NAME})."
+    exit 2
+  fi
+  HOSTS_JSON=$(awx hosts list --inventory "${INV_ID}" -f json --conf.color False </dev/null)
+  HOSTS_COUNT=$(printf '%s' "${HOSTS_JSON}" | count_items)
+  echo "Inventaire '${INV_NAME}' existe (id=${INV_ID})."
+  echo "Nombre d'hôtes: ${HOSTS_COUNT}"
+  exit 0
+fi
+
+if [[ "${DELETE_MODE}" == "true" ]]; then
+  if [[ -z "${INV_ID}" ]]; then
+    echo "Inventaire '${INV_NAME}' introuvable (org=${ORG_NAME}). Rien à supprimer."
+    exit 0
+  fi
+  echo "Suppression de l'inventaire '${INV_NAME}' (id=${INV_ID})…"
+  if ! awx inventories delete "${INV_ID}" --conf.color False </dev/null; then
+    echo "Échec de suppression (inventaire peut être référencé par d'autres objets)." >&2
+    exit 1
+  fi
+  echo "Inventaire supprimé."
+  exit 0
+fi
+
+# --- Mode BUILD-FROM-FAILED --------------------------------------------------
+if [[ -n "${BUILD_FROM_FAILED}" ]]; then
+  if [[ -z "${INV_NAME}" || -z "${INV_ID}" ]]; then
+    echo "Erreur: -B nécessite un inventaire source via -i (et existant)." >&2
+    exit 1
+  fi
+  echo "Extraction des failed-hosts depuis '${INV_NAME}' (id=${INV_ID})…"
+  mapfile -t FAILED_HOSTS < <(failed_host_names_from_inventory "${INV_ID}" | sort -u)
+  if ((${#FAILED_HOSTS[@]}==0)); then
+    echo "Aucun failed-host détecté."
+    exit 0
+  fi
+
+  DEST_INV_ID=$(awx inventories list --name "${BUILD_FROM_FAILED}" --organization "${ORG_ID}" -f json --conf.color False </dev/null | first_id || true)
+  if [[ -z "${DEST_INV_ID}" ]]; then
+    echo "Création de l'inventaire destination '${BUILD_FROM_FAILED}'…"
+    DEST_INV_ID=$(create_inventory "${BUILD_FROM_FAILED}")
+    [[ -z "${DEST_INV_ID}" ]] && { echo "Échec de création destination." >&2; exit 1; }
+  else
+    echo "Inventaire destination trouvé: '${BUILD_FROM_FAILED}' (id=${DEST_INV_ID})"
+  fi
+
+  if [[ "${PURGE_DEST}" == "true" ]]; then
+    purge_inventory_hosts "${DEST_INV_ID}"
+  end
+
+  DEST_GROUP_ID=""
+  if [[ -n "${GROUP}" ]]; then
+    DEST_GROUP_ID=$(ensure_group "${DEST_INV_ID}" "${GROUP}")
+  fi
+
+  echo "Ajout de ${#FAILED_HOSTS[@]} failed-host(s) dans '${BUILD_FROM_FAILED}'…"
+  for host in "${FAILED_HOSTS[@]}"; do
+    HID=$(first_or_create_host "${DEST_INV_ID}" "${host}")
+    [[ -z "${HID}" ]] && { echo "  ! Échec création hôte '${host}'" >&2; continue; }
+    echo "  = ${host} (id=${HID})"
+    [[ -n "${DEST_GROUP_ID}" ]] && awx groups associate --group "${DEST_GROUP_ID}" --host "${HID}" --conf.color False </dev/null >/dev/null 2>&1 || true
+  done
+  echo "Terminé."
+  exit 0
+fi
+
+# --- Lancement Template ------------------------------------------------------
+launch_template_with_inventory() {
+  local template_arg="$1" inv_id="$2"
+  local tpl_id
+
+  if [[ "${template_arg}" =~ ^[0-9]+$ ]]; then
+    tpl_id="${template_arg}"
+  else
+    tpl_id=$(awx job_templates list --name "${template_arg}" -f json --conf.color False </dev/null | first_id || true)
+    if [[ -z "${tpl_id}" ]]; then
+      echo "Job Template '${template_arg}' introuvable." >&2
+      exit 1
+    fi
+  fi
+
+  echo "Lancement du Job Template id=${tpl_id} avec inventory id=${inv_id}…"
+
+  local args=( job_templates launch "${tpl_id}" --inventory "${inv_id}" -f json --conf.color False )
+  if [[ -n "${EXTRA_VARS}" ]]; then
+    args+=( --extra-vars "${EXTRA_VARS}" )
+  fi
+
+  JOB_JSON=$(awx "${args[@]}" </dev/null)
+  JOB_ID=$(printf '%s' "${JOB_JSON}" | jq -r '.id // empty')
+  if [[ -z "${JOB_ID}" ]]; then
+    echo "Échec du lancement du job. Sortie:" >&2
+    printf '%s\n' "${JOB_JSON}" >&2
+    exit 1
+  fi
+
+  echo "Job lancé: id=${JOB_ID}. Suivi en cours…"
+  local job_ok=0
+  if ! awx jobs monitor "${JOB_ID}" --conf.color False </dev/null; then
+    echo "Le job ${JOB_ID} a échoué." >&2
+    job_ok=1
+  else
+    echo "Le job ${JOB_ID} est terminé avec succès."
+  fi
+
+  if [[ "${SHOW_FAILED}" == "true" ]]; then
+    echo "Hôtes en échec pour le job ${JOB_ID}:"
+    print_failed_hosts "${JOB_ID}"
+  fi
+
+  # Option -D / --failed-dest : stocker les failed-hosts dans un inventaire
+  if [[ -n "${FAILED_DEST_NAME}" ]]; then
+    echo "Collecte des failed-hosts pour alimentation de '${FAILED_DEST_NAME}'…"
+    mapfile -t FAILED_HOSTS < <(collect_failed_hosts_from_job "${JOB_ID}" | sort -u)
+    if ((${#FAILED_HOSTS[@]}==0)); then
+      echo "Aucun failed-host détecté pour ce job."
+    else
+      DEST_INV_ID=$(awx inventories list --name "${FAILED_DEST_NAME}" --organization "${ORG_ID}" -f json --conf.color False </dev/null | first_id || true)
+      if [[ -z "${DEST_INV_ID}" ]]; then
+        echo "Création de l'inventaire destination '${FAILED_DEST_NAME}'…"
+        DEST_INV_ID=$(create_inventory "${FAILED_DEST_NAME}")
+        [[ -z "${DEST_INV_ID}" ]] && { echo "Échec création inventaire '${FAILED_DEST_NAME}'." >&2; return ${job_ok}; }
+      else
+        echo "Inventaire destination trouvé: '${FAILED_DEST_NAME}' (id=${DEST_INV_ID})"
+      fi
+
+      if [[ "${PURGE_DEST}" == "true" ]]; then
+        purge_inventory_hosts "${DEST_INV_ID}"
+      fi
+
+      DEST_GROUP_ID=""
+      if [[ -n "${GROUP}" ]]; then
+        DEST_GROUP_ID=$(ensure_group "${DEST_INV_ID}" "${GROUP}")
+      fi
+
+      echo "Ajout de ${#FAILED_HOSTS[@]} host(s) en échec vers '${FAILED_DEST_NAME}'…"
+      for host in "${FAILED_HOSTS[@]}"; do
+        HID=$(first_or_create_host "${DEST_INV_ID}" "${host}")
+        [[ -z "${HID}" ]] && { echo "  ! Échec création hôte '${host}'" >&2; continue; }
+        echo "  = ${host} (id=${HID})"
+        [[ -n "${DEST_GROUP_ID}" ]] && awx groups associate --group "${DEST_GROUP_ID}" --host "${HID}" --conf.color False </dev/null >/dev/null 2>&1 || true
+      done
+    fi
+  fi
+
+  return ${job_ok}
+}
+
+# --- PATH 1: Mode Template (-T) ----------------------------------------------
+if [[ -n "${TEMPLATE_ARG}" ]]; then
+  if [[ -n "${INV_NAME}" ]]; then
+    if [[ -z "${INV_ID}" ]]; then
+      echo "Inventaire '${INV_NAME}' introuvable (org=${ORG_NAME})." >&2
+      exit 2
+    fi
+    echo "Utilisation de l'inventaire existant id=${INV_ID} ('${INV_NAME}')"
+    GROUP_ID=""
+    if [[ -n "${GROUP}" ]]; then
+      GROUP_ID=$(ensure_group "${INV_ID}" "${GROUP}")
+      echo "Groupe '${GROUP}' id=${GROUP_ID}"
+    fi
+    add_hosts_into_inventory "${INV_ID}" "${GROUP_ID}"
+    launch_template_with_inventory "${TEMPLATE_ARG}" "${INV_ID}"
+    exit $?
+  else
+    # inventaire temporaire
+    TS=$(date +%Y%m%d-%H%M%S)
+    TEMP_INV_NAME="TMP-${TEMPLATE_ARG// /_}-${TS}"
+    echo "Création d'un inventaire temporaire '${TEMP_INV_NAME}'…"
+    TEMP_INV_ID=$(create_inventory "${TEMP_INV_NAME}")
+    if [[ -z "${TEMP_INV_ID}" ]]; then
+      echo "Échec création inventaire temporaire." >&2
+      exit 1
+    fi
+    echo "Inventaire temporaire id=${TEMP_INV_ID}"
+
+    TEMP_GROUP_ID=""
+    if [[ -n "${GROUP}" ]]; then
+      TEMP_GROUP_ID=$(ensure_group "${TEMP_INV_ID}" "${GROUP}")
+      echo "Groupe '${GROUP}' id=${TEMP_GROUP_ID}"
+    fi
+    add_hosts_into_inventory "${TEMP_INV_ID}" "${TEMP_GROUP_ID}"
+
+    JOB_OK=0
+    if ! launch_template_with_inventory "${TEMPLATE_ARG}" "${TEMP_INV_ID}"; then
+      JOB_OK=1
+    fi
+
+    echo "Nettoyage: suppression de l'inventaire temporaire id=${TEMP_INV_ID}…"
+    awx inventories delete "${TEMP_INV_ID}" --conf.color False </dev/null || true
+
+    exit ${JOB_OK}
+  fi
+fi
+
+# --- PATH 2: Mode "gestion inventaire" (ajout d'hôtes) -----------------------
+if [[ -z "${INV_ID}" ]]; then
+  echo "Inventaire '${INV_NAME}' absent. Création…"
+  INV_ID=$(create_inventory "${INV_NAME}")
+  if [[ -z "${INV_ID}" ]]; then
+    echo "Échec de création de l'inventaire." >&2
+    exit 1
+  fi
+  echo "Inventaire créé: id=${INV_ID}"
+else
+  echo "Inventaire trouvé: '${INV_NAME}' (id=${INV_ID})"
+fi
+
+GROUP_ID=""
+if [[ -n "${GROUP}" ]]; then
+  GROUP_ID=$(ensure_group "${INV_ID}" "${GROUP}")
+  echo "Groupe '${GROUP}' id=${GROUP_ID}"
+fi
+
+add_hosts_into_inventory "${INV_ID}" "${GROUP_ID}"
+
+echo "Terminé."
