@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# aap_helpers.sh — fonctions utilitaires pour aap_load_inventory_awx.sh
+# Charge ce fichier via:  source "${SCRIPT_DIR}/aap_helpers.sh"
+
+# ---- Helpers jq (purement fonctionnels) -------------------------------------
+first_id() {
+  jq -r '
+    if type=="array" and length>0 then
+      .[0].id // empty
+    elif type=="object" and has("results") and (.results|type=="array") and ((.results|length)>0) then
+      .results[0].id // empty
+    elif type=="object" and has("id") then
+      .id // empty
+    else empty end
+  '
+}
+
+count_items() {
+  jq -r '
+    if type=="array" then length
+    elif type=="object" and has("count") then .count
+    elif type=="object" and has("results") and (.results|type=="array") then (.results|length)
+    else 0 end
+  '
+}
+
+list_names() {
+  jq -r '
+    if type=="array" then .[]?.name
+    elif type=="object" and has("results") then .results[]?.name
+    else empty end
+  '
+}
+
+# ---- Inventaires / Groupes / Hôtes ------------------------------------------
+create_inventory() {
+  # $1 = org_id, $2 = name
+  local org_id="$1" name="$2"
+  awx inventories create --name "${name}" --organization "${org_id}" -f json --conf.color False </dev/null |
+    jq -r '.id // empty'
+}
+
+ensure_group() {
+  # $1 = inventory_id, $2 = group_name
+  local inv_id="$1" group_name="$2"
+  local gid
+  gid=$(awx groups list --inventory "${inv_id}" --name "${group_name}" -f json --conf.color False </dev/null | first_id || true)
+  if [[ -z "${gid}" ]]; then
+    gid=$(awx groups create --inventory "${inv_id}" --name "${group_name}" -f json --conf.color False </dev/null | jq -r '.id // empty')
+  fi
+  printf '%s' "${gid}"
+}
+
+first_or_create_host() {
+  # $1 = inventory_id, $2 = hostname
+  local inv_id="$1" host="$2"
+  local hid
+  hid=$(awx hosts list --inventory "${inv_id}" --name "${host}" -f json --conf.color False </dev/null | first_id || true)
+  if [[ -z "${hid}" ]]; then
+    hid=$(awx hosts create --inventory "${inv_id}" --name "${host}" -f json --conf.color False </dev/null | jq -r '.id // empty' || true)
+  fi
+  printf '%s' "${hid}"
+}
+
+add_hosts_into_inventory() {
+  # $1 = inventory_id, $2 = group_id or empty, $3.. = list of hostnames
+  local inv_id="$1" group_id="${2:-}"; shift 2
+  local host
+  for host in "$@"; do
+    [[ -z "$host" ]] && continue
+    local hid
+    hid=$(first_or_create_host "${inv_id}" "${host}")
+    [[ -z "${hid}" ]] && { echo "  ! Échec création hôte '${host}'" >&2; continue; }
+    echo "  = ${host} (id=${hid})"
+    if [[ -n "${group_id}" ]]; then
+      awx groups associate --group "${group_id}" --host "${hid}" --conf.color False </dev/null >/dev/null 2>&1 || true
+    fi
+  done
+}
+
+purge_inventory_hosts() {
+  # $1 = inventory_id
+  local inv_id="$1"
+  echo "Purge des hôtes de l'inventaire id=${inv_id}…"
+  local page=1 deleted=0
+  while :; do
+    local json ids
+    json=$(awx hosts list --inventory "${inv_id}" --page "${page}" -f json --conf.color False </dev/null)
+    ids=$(printf '%s' "${json}" | jq -r '
+      if type=="array" then .[]
+      elif type=="object" and has("results") then .results[]
+      else empty end
+      | .id')
+    [[ -z "${ids}" ]] && break
+    while IFS= read -r hid; do
+      [[ -z "${hid}" ]] && continue
+      awx hosts delete "${hid}" --conf.color False </dev/null || true
+      ((deleted++))
+    done <<< "${ids}"
+    local has_next
+    has_next=$(printf '%s' "${json}" | jq -r 'if type=="object" and has("next") then (.next!=null) else "false" end')
+    [[ "${has_next}" == "true" ]] || break
+    ((page++))
+  done
+  echo "Purge terminée: ${deleted} hôte(s) supprimé(s)."
+}
+
+# ---- Failed hosts (inventaire & job) ----------------------------------------
+failed_host_names_from_inventory() {
+  # $1 = inventory_id
+  awx hosts list --inventory "$1" -f json --conf.color False </dev/null |
+  jq -r '
+    if type=="array" then .[]
+    elif type=="object" and has("results") then .results[]
+    else empty end
+    | select(.has_active_failures==true)
+    | .name
+  '
+}
+
+collect_failed_hosts_from_job() {
+  # $1 = job_id
+  local page=1
+  while :; do
+    local json
+    json=$(awx job_host_summaries list --job "$1" --page "${page}" -f json --conf.color False </devnull)
+    printf '%s' "${json}" | jq -r '
+      if type=="array" then .[]
+      elif type=="object" and has("results") then .results[]
+      else empty end
+      | select((.failed==true) or (.status=="failed") or (.failed==1))
+      | .host_name'
+    local has_next
+    has_next=$(printf '%s' "${json}" | jq -r 'if type=="object" and has("next") then (.next!=null) else "false" end')
+    [[ "${has_next}" == "true" ]] || break
+    ((page++))
+  done
+}
+
+print_failed_hosts() {
+  # $1 = job_id
+  local names
+  names=$(collect_failed_hosts_from_job "$1" | sort -u)
+  if [[ -n "${names}" ]]; then
+    printf '%s\n' "${names}"
+  else
+    echo "(aucun hôte en échec)"
+  fi
+}
+
+# ---- Lancement du template ---------------------------------------------------
+launch_template_with_inventory() {
+  # $1 = template_arg (id ou nom)
+  # $2 = inventory_id
+  # $3 = extra_vars string ou vide (ex: 'a=b c=d' ou '@file.yml')
+  # $4 = show_failed ("true"/"false")
+  # $5 = failed_dest_name (peut être vide)
+  # $6 = purge_dest ("true"/"false")
+  # $7 = org_id (pour créer failed_dest si besoin)
+  # $8 = optional group name (associer dans dest)
+  local template_arg="$1" inv_id="$2" extra_vars="$3" show_failed="$4" failed_dest="$5" purge_dest="$6" org_id="$7" dest_group="$8"
+
+  local tpl_id
+  if [[ "${template_arg}" =~ ^[0-9]+$ ]]; then
+    tpl_id="${template_arg}"
+  else
+    tpl_id=$(awx job_templates list --name "${template_arg}" -f json --conf.color False </dev/null | first_id || true)
+    [[ -z "${tpl_id}" ]] && { echo "Job Template '${template_arg}' introuvable." >&2; return 1; }
+  fi
+
+  echo "Lancement du Job Template id=${tpl_id} avec inventory id=${inv_id}…"
+  local args=( job_templates launch "${tpl_id}" --inventory "${inv_id}" -f json --conf.color False )
+  [[ -n "${extra_vars}" ]] && args+=( --extra-vars "${extra_vars}" )
+
+  local job_json job_id
+  job_json=$(awx "${args[@]}" </dev/null)
+  job_id=$(printf '%s' "${job_json}" | jq -r '.id // empty')
+  [[ -z "${job_id}" ]] && { echo "Échec du lancement du job." >&2; printf '%s\n' "${job_json}" >&2; return 1; }
+
+  echo "Job lancé: id=${job_id}. Suivi en cours…"
+  local job_ok=0
+  if ! awx jobs monitor "${job_id}" --conf.color False </dev/null; then
+    echo "Le job ${job_id} a échoué." >&2
+    job_ok=1
+  else
+    echo "Le job ${job_id} est terminé avec succès."
+  fi
+
+  if [[ "${show_failed}" == "true" ]]; then
+    echo "Hôtes en échec pour le job ${job_id}:"
+    print_failed_hosts "${job_id}"
+  fi
+
+  # Destination failed-dest (optionnelle)
+  if [[ -n "${failed_dest}" ]]; then
+    echo "Collecte des failed-hosts du job pour alimentation de '${failed_dest}'…"
+    mapfile -t FAILED_HOSTS < <(collect_failed_hosts_from_job "${job_id}" | sort -u)
+    if ((${#FAILED_HOSTS[@]}==0)); then
+      echo "Aucun failed-host détecté pour ce job."
+      return ${job_ok}
+    fi
+    local dest_inv_id
+    dest_inv_id=$(awx inventories list --name "${failed_dest}" --organization "${org_id}" -f json --conf.color False </dev/null | first_id || true)
+    if [[ -z "${dest_inv_id}" ]]; then
+      dest_inv_id=$(create_inventory "${org_id}" "${failed_dest}")
+      [[ -z "${dest_inv_id}" ]] && { echo "Échec création inventaire '${failed_dest}'." >&2; return ${job_ok}; }
+    fi
+    [[ "${purge_dest}" == "true" ]] && purge_inventory_hosts "${dest_inv_id}"
+
+    local dest_group_id=""
+    if [[ -n "${dest_group}" ]]; then
+      dest_group_id=$(ensure_group "${dest_inv_id}" "${dest_group}")
+    fi
+    echo "Ajout de ${#FAILED_HOSTS[@]} host(s) en échec vers '${failed_dest}'…"
+    add_hosts_into_inventory "${dest_inv_id}" "${dest_group_id}" "${FAILED_HOSTS[@]}"
+  fi
+
+  return ${job_ok}
+}
