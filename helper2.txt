@@ -1,0 +1,99 @@
+launch_template_with_inventory() {
+  # $1 = template_arg (id ou nom)
+  # $2 = inventory_id
+  # $3 = extra_vars string ou vide (ex: 'a=b c=d' ou '@file.yml' ou YAML/JSON inline)
+  # $4 = show_failed ("true"/"false")
+  # $5 = failed_dest_name (peut être vide)
+  # $6 = purge_dest ("true"/"false")
+  # $7 = org_id (pour créer failed_dest si besoin)
+  # $8 = optional group name (associer dans dest)
+  # $9 = verbose ("true"/"false") -> monitor si true, attente silencieuse sinon
+  # $10 = credential IDs (séparés par des espaces) ex: "12 34"
+  local template_arg="$1" inv_id="$2" extra_vars="$3" show_failed="$4" failed_dest="$5" purge_dest="$6" org_id="$7" dest_group="$8" verbose="${9:-false}"
+  shift 9
+  # ce qui reste ($@) commence par la liste d'IDs de credentials (éventuellement vide)
+  local cred_ids_ws="${1:-}"
+
+  # Résoudre l'ID du template
+  local tpl_id
+  if [[ "${template_arg}" =~ ^[0-9]+$ ]]; then
+    tpl_id="${template_arg}"
+  else
+    tpl_id=$(awx job_templates list --name "${template_arg}" -f json --conf.color False </dev/null | first_id || true)
+    [[ -z "${tpl_id}" ]] && { echo "Job Template '${template_arg}' introuvable." >&2; return 1; }
+  fi
+
+  # Préparer --extra_vars robuste
+  local extra_arg=""
+  if [[ -n "${extra_vars}" ]]; then
+    extra_arg="$(prepare_extra_vars_arg "${extra_vars}")"
+  fi
+
+  # Construire la commande de lancement
+  local args=( job_templates launch "${tpl_id}" --inventory "${inv_id}" -f json --conf.color False )
+  [[ -n "${extra_arg}" ]] && args+=( --extra_vars "${extra_arg}" )
+
+  # Ajouter les credentials si fournis (répéter --credential <id>)
+  if [[ -n "${cred_ids_ws}" ]]; then
+    local cid
+    for cid in ${cred_ids_ws}; do
+      [[ -n "${cid}" ]] && args+=( --credential "${cid}" )
+    done
+  fi
+
+  # Lancer le job
+  local job_json job_id
+  job_json=$(awx "${args[@]}" </dev/null)
+  job_id=$(printf '%s' "${job_json}" | jq -r '.id // empty')
+  [[ -z "${job_id}" ]] && { echo "Échec du lancement du job." >&2; printf '%s\n' "${job_json}" >&2; return 1; }
+
+  # Attente (monitor si verbose, sinon polling silencieux)
+  local status=""
+  if [[ "${verbose}" == "true" ]]; then
+    echo "Job lancé: id=${job_id}. Affichage en direct…"
+    awx jobs monitor "${job_id}" --conf.color False </dev/null || true
+    status="$(awx jobs get "${job_id}" -f json --conf.color False </dev/null | jq -r '.status // empty')"
+  else
+    echo "Job lancé: id=${job_id}. Attente silencieuse de la fin…"
+    while :; do
+      status=$(awx jobs get "${job_id}" -f json --conf.color False </dev/null | jq -r '.status // empty')
+      case "$status" in
+        successful|failed|error|canceled) break ;;
+        *) sleep 2 ;;
+      esac
+    done
+  fi
+
+  local job_ok=0
+  if [[ "$status" == "successful" ]]; then
+    echo "Statut final du job ${job_id}: successful."
+  else
+    echo "Statut final du job ${job_id}: ${status}." >&2
+    job_ok=1
+  fi
+
+  # Affichage des failed-hosts si demandé
+  if [[ "${show_failed}" == "true" ]]; then
+    echo "Hôtes en échec pour le job ${job_id}:"
+    print_failed_hosts "${job_id}"
+  fi
+
+  # Destination failed-dest (optionnelle)
+  if [[ -n "${failed_dest}" ]]; then
+    echo "Collecte des failed-hosts du job pour alimentation de '${failed_dest}'…"
+    mapfile -t FAILED_HOSTS < <(collect_failed_hosts_from_job "${job_id}" | sort -u)
+    if ((${#FAILED_HOSTS[@]})); then
+      local dest_inv_id
+      dest_inv_id=$(awx inventories list --name "${failed_dest}" --organization "${org_id}" -f json --conf.color False </dev/null | first_id || true)
+      [[ -z "${dest_inv_id}" ]] && dest_inv_id=$(create_inventory "${org_id}" "${failed_dest}")
+      [[ "${purge_dest}" == "true" ]] && purge_inventory_hosts "${dest_inv_id}"
+      local dest_group_id=""
+      [[ -n "${dest_group}" ]] && dest_group_id=$(ensure_group "${dest_inv_id}" "${dest_group}")
+      add_hosts_into_inventory "${dest_inv_id}" "${dest_group_id}" "${FAILED_HOSTS[@]}"
+    else
+      echo "Aucun failed-host détecté pour ce job."
+    fi
+  fi
+
+  return ${job_ok}
+}
