@@ -1,32 +1,83 @@
-# Normalise une liste CSV passée en plusieurs arguments (ex: "a,b" "c" ...)
-# Usage:
-#   normalize_csv_list [-u] OUTVAR INPUT1 [INPUT2 ...]
-#   -u : dédoublonne (préserve l'ordre)
-# Exemple:
-#   normalize_csv_list -u CLI_HOSTS "${CLI_HOSTS_RAW[@]}"
-normalize_csv_list() {
-  local dedupe="false"
-  if [[ "${1:-}" == "-u" ]]; then
-    dedupe="true"; shift
+# passe TOUTES les options supplémentaires à curl
+_aap_curl_json() {
+  local url="$1"; shift || true
+  local -a args=(-sS --fail --header "Content-Type: application/json")
+  [[ -n "${AAP_INSECURE:-}" ]] && args+=(-k)
+  if [[ -n "${TOKEN:-}" ]]; then
+    args+=(--header "Authorization: Bearer ${TOKEN}")
+  elif [[ -n "${USER:-}" && -n "${PASS:-}" ]]; then
+    args+=(-u "${USER}:${PASS}")
   fi
-  local -n _out="$1"; shift || true
-  _out=()
-
-  declare -A _seen=()
-  local IFS_SAVE=$IFS
-  IFS=,
-  for chunk in "$@"; do
-    for tok in $chunk; do
-      # enlever \r puis trim
-      tok="${tok//$'\r'/}"
-      tok="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"$tok")"
-      [[ -z "$tok" ]] && continue
-      if [[ "$dedupe" == "true" ]]; then
-        [[ -n "${_seen[$tok]+x}" ]] && continue
-        _seen["$tok"]=1
-      fi
-      _out+=("$tok")
-    done
-  done
-  IFS=$IFS_SAVE
+  # IMPORTANT: "$@" avant l'URL => permet d'injecter --request/--data depuis l'appelant
+  curl "${args[@]}" "$@" "$url"
 }
+
+_aap_curl_post_json() {
+  local url="$1" data="$2"
+  _aap_curl_json "$url" --request POST --header "Accept: application/json" --data "$data"
+}
+
+bulk_add_hosts_into_inventory() {
+  local inv_id="$1" group_id="${2:-}"; shift 2
+  local base="${URL%/}"
+  local bulk_url="${base}/api/v2/bulk/host_create/"
+  local batch_size="${BULK_BATCH_SIZE:-200}"
+
+  # dédoublonnage simple + filtrage des vides
+  declare -A SEEN=()
+  local HOSTS=() h
+  for h in "$@"; do
+    [[ -z "$h" ]] && continue
+    [[ -n "${SEEN[$h]+x}" ]] && continue
+    SEEN["$h"]=1
+    HOSTS+=("$h")
+  done
+
+  ((${#HOSTS[@]})) || { echo "Aucun hôte à créer (bulk)."; return 0; }
+
+  echo "Création bulk de ${#HOSTS[@]} hôte(s) dans inventory id=${inv_id}…"
+
+  local i=0 created_total=0
+  while (( i < ${#HOSTS[@]} )); do
+    local end=$(( i + batch_size ))
+    (( end > ${#HOSTS[@]} )) && end=${#HOSTS[@]}
+
+    # Construire le payload en UNE passe jq :
+    #  - on fabrique un tableau JSON de noms à partir du slice bash
+    #  - puis jq produit {inventory: <id>, hosts: [ {name: "<nom>"} … ] }
+    local names_json
+    # fabrique ["h1","h2",...]
+    names_json=$(
+      printf '%s\n' "${HOSTS[@]:i:end-i}" | jq -R -s 'split("\n") | map(select(length>0))'
+    )
+
+    local payload
+    payload=$(jq -cn --argjson inv "$inv_id" --argjson names "$names_json" \
+      '{inventory:$inv, hosts: ($names | map({name:.}))}')
+
+    # POST bulk
+    local resp
+    if ! resp=$(_aap_curl_post_json "$bulk_url" "$payload"); then
+      echo "Échec bulk host_create (lot ${i}-${end})." >&2
+      return 1
+    fi
+
+    # combien créés (si l’API renvoie .created)
+    local created_this
+    created_this=$(jq -r 'if type=="object" and has("created") then
+                            ( .created | if type=="array" then length else 0 end )
+                          else 0 end' <<<"$resp")
+    (( created_total += created_this ))
+
+    i=$end
+  done
+
+  echo "Création bulk terminée. ${created_total} hôte(s) créés (ou déjà présents)."
+
+  # Association au groupe si demandé
+  if [[ -n "$group_id" ]]; then
+    echo "Association des hôtes au groupe id=${group_id}…"
+    _associate_hosts_to_group_by_names "$inv_id" "$group_id" "${HOSTS[@]}"
+  fi
+}
+
