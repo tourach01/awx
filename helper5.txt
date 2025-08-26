@@ -1,0 +1,32 @@
+# Normalise une liste CSV passée en plusieurs arguments (ex: "a,b" "c" ...)
+# Usage:
+#   normalize_csv_list [-u] OUTVAR INPUT1 [INPUT2 ...]
+#   -u : dédoublonne (préserve l'ordre)
+# Exemple:
+#   normalize_csv_list -u CLI_HOSTS "${CLI_HOSTS_RAW[@]}"
+normalize_csv_list() {
+  local dedupe="false"
+  if [[ "${1:-}" == "-u" ]]; then
+    dedupe="true"; shift
+  fi
+  local -n _out="$1"; shift || true
+  _out=()
+
+  declare -A _seen=()
+  local IFS_SAVE=$IFS
+  IFS=,
+  for chunk in "$@"; do
+    for tok in $chunk; do
+      # enlever \r puis trim
+      tok="${tok//$'\r'/}"
+      tok="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"$tok")"
+      [[ -z "$tok" ]] && continue
+      if [[ "$dedupe" == "true" ]]; then
+        [[ -n "${_seen[$tok]+x}" ]] && continue
+        _seen["$tok"]=1
+      fi
+      _out+=("$tok")
+    done
+  done
+  IFS=$IFS_SAVE
+}
