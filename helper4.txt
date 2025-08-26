@@ -1,0 +1,150 @@
+# =================== HTTP helpers pour l'API Tower/AWX =======================
+# Variables d'env utilisées:
+#   URL   : https://aap.example.com  (obligatoire)
+#   TOKEN : Bearer token (recommandé)  OU  USER + PASS (basic auth)
+#   AAP_INSECURE=1 -> -k (TLS permissif)
+_aap_curl_json() {
+  local url="$1"; shift || true
+  local -a args=(-sS --fail --header "Content-Type: application/json")
+  [[ -n "${AAP_INSECURE:-}" ]] && args+=(-k)
+  if [[ -n "${TOKEN:-}" ]]; then
+    args+=(--header "Authorization: Bearer ${TOKEN}")
+  elif [[ -n "${USER:-}" && -n "${PASS:-}" ]]; then
+    args+=(-u "${USER}:${PASS}")
+  fi
+  curl "${args[@]}" "$url"
+}
+
+_aap_curl_post_json() {
+  local url="$1" data="$2"
+  _aap_curl_json "$url" \
+    --request POST \
+    --header "Accept: application/json" \
+    --data "$data"
+}
+
+# ====================== BULK: création d'hôtes ===============================
+# bulk_add_hosts_into_inventory <inventory_id> <group_id-or-empty> <host1> [host2 ...]
+# - crée les hôtes en BATCH (par défaut 200) via /api/v2/bulk/host_create/
+# - si <group_id> fourni, associe ensuite les hôtes créés au groupe
+# - attendu: URL + (TOKEN || USER+PASS) présents dans l'environnement
+bulk_add_hosts_into_inventory() {
+  local inv_id="$1" group_id="${2:-}"; shift 2
+  local base="${URL%/}"
+  local bulk_url="${base}/api/v2/bulk/host_create/"
+  local batch_size="${BULK_BATCH_SIZE:-200}"
+
+  # dédoublonnage simple + filtrage des vides
+  declare -A SEEN=()
+  local HOSTS=()
+  local h
+  for h in "$@"; do
+    [[ -z "$h" ]] && continue
+    [[ -n "${SEEN[$h]+x}" ]] && continue
+    SEEN["$h"]=1
+    HOSTS+=("$h")
+  done
+
+  ((${#HOSTS[@]})) || { echo "Aucun hôte à créer (bulk)." ; return 0; }
+
+  echo "Création bulk de ${#HOSTS[@]} hôte(s) dans inventory id=${inv_id}…"
+
+  # envoi par lots
+  local i=0 created_total=0
+  while (( i < ${#HOSTS[@]} )); do
+    local end=$(( i + batch_size ))
+    (( end > ${#HOSTS[@]} )) && end=${#HOSTS[@]}
+
+    # construire le tableau JSON des hosts: [{ "name": "host" }, ...]
+    local hosts_arr="[]"
+    local j
+    for (( j=i; j<end; j++ )); do
+      hosts_arr=$(jq -c --arg n "${HOSTS[j]}" '. + [{name:$n}]' <<<"$hosts_arr")
+    done
+
+    local payload
+    payload=$(jq -c --argjson inv "$inv_id" --argjson hosts "$hosts_arr" \
+      '{inventory: $inv, hosts: $hosts}')
+
+    # POST bulk
+    local resp
+    if ! resp=$(_aap_curl_post_json "$bulk_url" "$payload"); then
+      echo "Échec bulk host_create (lot ${i}-${end})." >&2
+      return 1
+    fi
+
+    # Affichage synthétique (facultatif) du résultat
+    local created_this
+    created_this=$(jq -r '
+      if type=="object" and has("created") then
+        ( .created | if type=="array" then length else 0 end )
+      else 0 end' <<<"$resp")
+    (( created_total += created_this ))
+
+    i=$end
+  done
+
+  echo "Création bulk terminée. ${created_total} hôte(s) créés (ou déjà existants selon versions)."
+
+  # Association au groupe si demandé
+  if [[ -n "$group_id" ]]; then
+    echo "Association des hôtes au groupe id=${group_id}…"
+    _associate_hosts_to_group_by_names "$inv_id" "$group_id" "${HOSTS[@]}"
+  fi
+}
+
+# Associer une liste d'hôtes (par leurs NOMS) à un groupe
+#   _associate_hosts_to_group_by_names <inventory_id> <group_id> <name1> [name2 ...]
+# Implémente:
+#   - récupère la map (name -> id) de tous les hôtes de l'inventaire (pagination)
+#   - POST /api/v2/groups/<gid>/hosts/  {"id": <host_id>} pour chaque nom trouvé
+_associate_hosts_to_group_by_names() {
+  local inv_id="$1" group_id="$2"; shift 2
+  local -a WANT_NAMES=( "$@" )
+  ((${#WANT_NAMES[@]})) || return 0
+
+  # construire un set pour lookup
+  declare -A WANT=()
+  local n
+  for n in "${WANT_NAMES[@]}"; do WANT["$n"]=1; done
+
+  local base="${URL%/}"
+  local list_url="${base}/api/v2/hosts/?inventory=${inv_id}&page_size=200"
+  declare -A NAME2ID=()
+
+  # parcourir tous les hosts de l'inventaire et ne garder que ceux demandés
+  while [[ -n "$list_url" ]]; do
+    local json
+    if ! json=$(_aap_curl_json "$list_url"); then
+      echo "Échec GET hosts inventory=${inv_id}" >&2
+      break
+    fi
+    # extraire name & id
+    # on ne retient que les names présents dans WANT
+    while IFS=$'\t' read -r _id _name; do
+      [[ -z "${WANT[$_name]+x}" ]] && continue
+      NAME2ID["$_name"]="${_id}"
+    done < <(jq -r '
+      (if type=="object" and has("results") then .results else . end)
+      | .[]? | "\(.id)\t\(.name)"' <<<"$json")
+
+    list_url=$(jq -r '
+      if type=="object" and has("next") and (.next!=null) then .next else "" end
+    ' <<<"$json")
+  done
+
+  # associer
+  local assoc_url="${base}/api/v2/groups/${group_id}/hosts/"
+  local done_count=0 miss_count=0
+  for n in "${WANT_NAMES[@]}"; do
+    local hid="${NAME2ID[$n]:-}"
+    if [[ -z "$hid" ]]; then
+      ((miss_count++))
+      echo "  ! host '${n}' introuvable (inventaire ${inv_id})" >&2
+      continue
+    fi
+    _aap_curl_post_json "$assoc_url" "$(jq -c --argjson id "$hid" '{id:$id}')" >/dev/null || true
+    ((done_count++))
+  done
+  echo "Association groupe: ${done_count} lié(s), ${miss_count} introuvable(s)."
+}
