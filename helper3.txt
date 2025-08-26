@@ -1,0 +1,77 @@
+# --------------------------------------------------------------------
+# Helpers HTTP pour l’API Tower/AWX
+# Variables attendues dans l’environnement:
+#   URL  : https://aap.example.com   (obligatoire)
+#   TOKEN  (optionnel)    OU    USER + PASS  (optionnel)
+#   AAP_INSECURE=1  -> ajoute -k à curl
+# --------------------------------------------------------------------
+_aap_curl_json() {
+  # $1 = URL complète à appeler
+  local url="$1"
+  local -a args=( -sS --fail --header "Content-Type: application/json" )
+  [[ -n "${AAP_INSECURE:-}" ]] && args+=( -k )
+
+  if [[ -n "${TOKEN:-}" ]]; then
+    args+=( --header "Authorization: Bearer ${TOKEN}" )
+  elif [[ -n "${USER:-}" && -n "${PASS:-}" ]]; then
+    args+=( -u "${USER}:${PASS}" )
+  fi
+
+  curl "${args[@]}" "$url"
+}
+
+# --------------------------------------------------------------------
+# Collecte des failed hosts via l’API /job_host_summaries (sans 'awx')
+#   Entrée: $1 = JOB_ID
+#   Sortie: écrit les noms d’hôte en échec (un par ligne) sur stdout
+#   Code retour:
+#     0 si au moins un host est trouvé (et imprimé)
+#     1 si erreur HTTP/API
+#     2 si aucun host en échec
+# --------------------------------------------------------------------
+collect_failed_hosts_via_summaries_api() {
+  local job_id="${1:?usage: collect_failed_hosts_via_summaries_api <job_id>}"
+  local base="${URL%/}"
+  local url="${base}/api/v2/jobs/${job_id}/job_host_summaries/?page_size=200"
+  local any=0
+
+  while [[ -n "${url}" ]]; do
+    # Appel API
+    local json
+    if ! json=$(_aap_curl_json "${url}"); then
+      echo "Erreur: appel API échoué sur ${url}" >&2
+      return 1
+    fi
+
+    # Extraire les noms en échec (selon champs 'failed' / 'status')
+    # On gère à la fois la réponse paginée (object {results, next}) et un array nu
+    local names
+    names=$(printf '%s' "${json}" | jq -r '
+      # normaliser: prendre .results si présent sinon soi-même
+      (if type=="object" and has("results") then .results else . end)
+      | map(
+          select((.failed==true) or (.failed==1) or (.status=="failed"))
+          # host_name est généralement présent; fallback sur summary_fields.host.name si dispo
+        )
+      | .[]
+      | (.host_name // (.summary_fields.host.name // empty))
+      | select(. != null and . != "")
+    ')
+
+    if [[ -n "${names}" ]]; then
+      any=1
+      printf '%s\n' "${names}"
+    fi
+
+    # Pagination: suivre .next s'il existe, sinon on sort
+    local next
+    next=$(printf '%s' "${json}" | jq -r 'if type=="object" and has("next") and (.next!=null) then .next else "" end')
+    url="${next}"
+  done
+
+  if [[ ${any} -eq 1 ]]; then
+    return 0
+  else
+    return 2
+  fi
+}
