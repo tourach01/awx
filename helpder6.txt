@@ -1,0 +1,81 @@
+show_job_stdout() {
+  # $1 = job_id
+  local job_id="${1:?usage: show_job_stdout <job_id>}"
+
+  if awx jobs stdout "${job_id}" --conf.color False </dev/null; then
+    return 0
+  fi
+
+  local base="${URL%/}"
+  local url="${base}/api/v2/jobs/${job_id}/stdout/?format=txt_download"
+  if _aap_curl_json "${url}"; then
+    return 0
+  fi
+
+  return 1
+}
+
+---------------
+launch_template_with_inventory() {
+  # $1..$8 = comme avant
+  # $9  = verbose ("true"/"false")
+  # $10 = credential IDs "12 34" (peut être vide)
+  # $11 = verbosity level "0..5" (peut être vide)
+  local template_arg="$1" inv_id="$2" extra_vars="$3" show_failed="$4" failed_dest="$5" purge_dest="$6" org_id="$7" dest_group="$8" verbose="${9:-false}"
+  shift 9
+  local cred_ids_ws="${1:-}"; shift || true
+  local verbosity_level="${1:-}"
+
+--------------------
+
+  local args=( job_templates launch "${tpl_id}" --inventory "${inv_id}" -f json --conf.color False )
+  [[ -n "${extra_arg}" ]] && args+=( --extra_vars "${extra_arg}" )
+
+  # Credentials (répéter --credential <id>)
+  if [[ -n "${cred_ids_ws}" ]]; then
+    local cid
+    for cid in ${cred_ids_ws}; do
+      [[ -n "${cid}" ]] && args+=( --credential "${cid}" )
+    done
+  fi
+
+  # Verbosity (0..5) si fourni
+  if [[ -n "${verbosity_level}" ]]; then
+    args+=( --verbosity "${verbosity_level}" )
+  fi
+--------------------
+
+
+
+  -J, --show-stdout JOB_ID  Afficher le stdout d'un job existant (ne lance rien)
+      --verbosity LEVEL     Niveau de verbosité au lancement (-T). Ex: 0..5
+                             0=None, 1=Verbose, 2=More, 3=Debug, 4=Conn, 5=WinRM
+
+
+SHOW_STDOUT_JOB_ID=""
+VERBOSITY_LEVEL=""
+
+    
+    -J|--show-stdout) SHOW_STDOUT_JOB_ID="${2:?}"; shift 2 ;;
+    --verbosity)      VERBOSITY_LEVEL="${2:?}";   shift 2 ;;
+
+if [[ -n "${SHOW_STDOUT_JOB_ID}" ]]; then
+  # Affiche le stdout du job via CLI; fallback API si indisponible
+  if ! show_job_stdout "${SHOW_STDOUT_JOB_ID}"; then
+    echo "Impossible d'afficher le stdout pour le job ${SHOW_STDOUT_JOB_ID}." >&2
+    exit 1
+  fi
+  exit 0
+fi
+
+
+launch_template_with_inventory \
+  "${TEMPLATE_ARG}" "${INV_ID}" \
+  "${EXTRA_VARS}" "${SHOW_FAILED}" \
+  "${FAILED_DEST_NAME}" "${PURGE_DEST}" \
+  "${ORG_ID}" "${GROUP:-}" \
+  "${VERBOSE}" \
+  "${CRED_IDS[*]}" \
+  "${VERBOSITY_LEVEL}"
+
+    
