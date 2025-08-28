@@ -1,195 +1,235 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --- CONFIG DE BASE ---
-ARTI_URL="${ARTI_URL:-https://artifactory.example.com}"   # export ARTI_URL=...
-ARTI_TOKEN="${ARTI_TOKEN:-}"                               # export ARTI_TOKEN=... (Access Token)
-AUTH_HEADER=()
-if [[ -n "${ARTI_TOKEN}" ]]; then
-  AUTH_HEADER=(-H "Authorization: Bearer ${ARTI_TOKEN}")
-fi
+# =========================
+# Config / Auth
+# =========================
+ARTI_URL="${ARTI_URL:-https://artifactory.example.com}"
+# Choix de la base API:
+#   - "artifactory" => https://host/artifactory/api/...
+#   - "root"        => https://host/api/...
+ARTI_API_BASE="${ARTI_API_BASE:-artifactory}"   # ou "root"
 
+ARTI_TOKEN="${ARTI_TOKEN:-}"   # Bearer (Access/Identity token)
+ARTI_USER="${ARTI_USER:-}"     # Basic
+ARTI_PASS="${ARTI_PASS:-}"     # Basic
+
+# =========================
+# Helpers
+# =========================
 usage() {
-  cat <<EOF
+  cat <<'EOF'
 Usage:
-  # Mode 1: copier tout un dossier (récursif) en 1 appel:
-  $0 folder --from REPO_A/path/source --to REPO_B/path/dest [--dry]
+  MODE 1: Copier un dossier entier (récursif) en 1 appel
+    artifactory-copy.sh folder --from REPO_A/path/source --to REPO_B/path/dest [--dry]
 
-  # Mode 2: copier un sous-ensemble par AQL (filtrage, ex: pattern, dates, properties):
-  $0 aql --from REPO_A/path/source --to REPO_B/path/dest [--name-glob "*.jar"] [--props "key=value"] [--since "2025-01-01"] [--dry]
+  MODE 2: Copier un sous-ensemble via AQL (liste -> copy)
+    artifactory-copy.sh aql --from REPO_A/path/prefix --to REPO_B/path/prefix \
+      [--name-glob "*.jar"] [--since "YYYY-MM-DD"] [--props "k=v;k2=v2"] [--dry] \
+      [--rewrite-from "x86_64/7Server"] [--rewrite-to "x86_64/9Server"]
+
+  MODE 3: AQL-SAFE (ne copie que si sha1 différent à destination)
+    artifactory-copy.sh aql-safe --from REPO_A/path/prefix --to REPO_B/path/prefix \
+      [--name-glob "*.jar"] [--since "YYYY-MM-DD"] [--props "k=v;k2=v2"] [--dry] \
+      [--rewrite-from "A"] [--rewrite-to "B"]
 
 Variables d'env:
-  ARTI_URL   : URL Artifactory (ex: https://artifactory.example.com)
-  ARTI_TOKEN : Access token (recommandé). Sinon, ajoute -u "user:pass" dans CURL_EXTRA.
+  ARTI_URL        : https://artifactory.exemple.com
+  ARTI_API_BASE   : "artifactory" (défaut) ou "root"
+  ARTI_TOKEN      : token Bearer
+  ARTI_USER/PASS  : user/pass (si pas de token)
 
-Exemples:
-  # Copier tout le dossier:
-  ARTI_URL=https://arti.local ARTI_TOKEN=XXXXX \\
-  $0 folder --from libs-snapshot-local/com/acme/app/branches/A \\
-            --to   libs-snapshot-local/com/acme/app/branches/B
-
-  # Copier seulement les JAR modifiés depuis le 1er juillet 2025:
-  ARTI_URL=https://arti.local ARTI_TOKEN=XXXXX \\
-  $0 aql --from libs-release-local/com/acme/app/branches/A \\
-         --to   libs-release-local/com/acme/app/branches/B \\
-         --name-glob "*.jar" --since "2025-07-01"
+Notes:
+  - --dry exécute en "dry-run" côté /api/copy (param ?dry=1)
+  - --rewrite-from/--rewrite-to réécrivent le préfixe du path côté destination.
+    Ex: path source "x86_64/7Server/os" -> rewrite en "x86_64/9Server/os".
 EOF
 }
 
 die(){ echo "ERR: $*" >&2; exit 1; }
 
-urlenc() { # URL-encode une chaîne
-  local s="${1}"; local out=""
-  local i ch
+auth_args=()
+if [[ -n "$ARTI_TOKEN" ]]; then
+  auth_args=(-H "Authorization: Bearer ${ARTI_TOKEN}")
+elif [[ -n "${ARTI_USER}" && -n "${ARTI_PASS}" ]]; then
+  auth_args=(-u "${ARTI_USER}:${ARTI_PASS}")
+else
+  die "Fournis ARTI_TOKEN ou ARTI_USER/ARTI_PASS"
+fi
+
+api_base() {
+  local path="$1" # ex: "search/aql"
+  if [[ "$ARTI_API_BASE" == "root" ]]; then
+    printf "%s/api/%s" "${ARTI_URL%/}" "$path"
+  else
+    printf "%s/artifactory/api/%s" "${ARTI_URL%/}" "$path"
+  fi
+}
+
+urlenc() {
+  local s="$1" out="" c
   for ((i=0;i<${#s};i++)); do
-    ch="${s:i:1}"
-    case "$ch" in
-      [a-zA-Z0-9.~_-]) out+="$ch" ;;
-      *) printf -v out '%s%%%02X' "$out" "'$ch" ;;
-    esac
+    c="${s:i:1}"
+    [[ "$c" =~ [a-zA-Z0-9.~_-] ]] && out+="$c" || printf -v out '%s%%%02X' "$out" "'$c"
   done
   printf '%s' "$out"
 }
 
-# --- PARSING ARGS ---
+# =========================
+# Parse args
+# =========================
 MODE="${1:-}"; shift || true
-FROM=""; TO=""; NAME_GLOB=""; SINCE=""; PROPS=""; DRY=0
+[[ -n "${MODE}" ]] || { usage; exit 1; }
+
+FROM=""; TO=""; NAME_GLOB=""; SINCE=""; PROPS=""; DRY=0; REW_FROM=""; REW_TO=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --from) FROM="$2"; shift 2;;
-    --to)   TO="$2"; shift 2;;
+    --to) TO="$2"; shift 2;;
     --name-glob) NAME_GLOB="$2"; shift 2;;
     --since) SINCE="$2"; shift 2;;
-    --props) PROPS="$2"; shift 2;;       # ex: "release=prod;team=core"
+    --props) PROPS="$2"; shift 2;;
     --dry) DRY=1; shift;;
+    --rewrite-from) REW_FROM="$2"; shift 2;;
+    --rewrite-to) REW_TO="$2"; shift 2;;
     -h|--help) usage; exit 0;;
-    *) break;;
+    *) echo "Arg inconnu: $1"; usage; exit 1;;
   esac
 done
 
-[[ -n "$ARTI_URL" ]] || die "ARTI_URL non défini"
-[[ "$MODE" == "folder" || "$MODE" == "aql" ]] || { usage; exit 1; }
-[[ -n "$FROM" && -n "$TO" ]] || die "--from et --to sont requis (repo/path)"
+[[ -n "$FROM" && -n "$TO" ]] || die "--from et --to requis (repo/path)"
 
-# --- MODE 1: COPIE D'UN DOSSIER ENTIER (récursif) ---
-if [[ "$MODE" == "folder" ]]; then
-  SRC_REPO="${FROM%%/*}"
-  SRC_PATH="${FROM#*/}"     # peut être vide si on copie la racine du repo
-  TO_ENC="$(urlenc "$TO")"
+SRC_REPO="${FROM%%/*}"
+SRC_PATH="${FROM#*/}"      # peut être vide si racine
+DST_REPO="${TO%%/*}"
+DST_PATH="${TO#*/}"
 
-  # L’endpoint copy:
-  # POST /api/copy/{repoKey}/{path}?to=repoKey/destPath&dry=1
-  DRY_PARAM=$([[ $DRY -eq 1 ]] && echo "&dry=1" || echo "")
-  SRC_PATH_ENC="$(urlenc "$SRC_PATH")"
-  COPY_URL="${ARTI_URL%/}/api/copy/${SRC_REPO}/${SRC_PATH_ENC}?to=${TO_ENC}${DRY_PARAM}"
-
-  echo ">> Copy folder: ${FROM}  ->  ${TO}  (dry=${DRY})"
-  curl -sfSL -X POST "${AUTH_HEADER[@]}" "$COPY_URL"
-
-  echo; echo "OK"
-  exit 0
-fi
-
-# --- MODE 2: COPIE PAR AQL (filtrage) ---
-if [[ "$MODE" == "aql" ]]; then
-  SRC_REPO="${FROM%%/*}"
-  SRC_PATH="${FROM#*/}"
-
-  # Construire la requête AQL
-  # On filtre par repo + path prefix, et optionnellement par nom (glob), properties, date (created/modified).
-  # NB: Artifactory AQL: "items.find({\"repo\":\"...\",\"path\":{\"$match\":\"prefix*\"},\"name\":{\"$match\":\"*.jar\"}})"
-  AQL_FILTERS=$(cat <<JSON
-{
-  "repo": "${SRC_REPO}",
-  "path": {"\$match": "$(echo "$SRC_PATH" | sed 's/"/\\"/g')*"}
-}
-JSON
-)
-
+# =========================
+# AQL builder (items.find)
+# =========================
+build_aql() {
+  # Construit un AQL items.find(...) selon FROM + filtres
+  # path: match sur SRC_PATH + '*', racine = "."
+  local pfx="$SRC_PATH"
+  [[ -z "$pfx" ]] && pfx="."
+  local aql='items.find({'
+  aql+='"repo":{"$eq":"'"$SRC_REPO"'"},'
+  aql+='"path":{"$match":"'"$pfx"'*"}'
   if [[ -n "$NAME_GLOB" ]]; then
-    AQL_FILTERS=$(echo "$AQL_FILTERS" | jq --arg g "$NAME_GLOB" '. + {"name":{"$match":$g}}')
+    aql+=',"name":{"$match":"'"$NAME_GLOB"'"}'
   fi
-
   if [[ -n "$SINCE" ]]; then
-    # Filtrer sur "modified" >= date ISO (Artifactory accepte "2025-07-01T00:00:00.000Z" ou juste "2025-07-01")
-    AQL_FILTERS=$(echo "$AQL_FILTERS" | jq --arg d "$SINCE" '. + {"modified":{"$gt":$d}}')
+    aql+=',"modified":{"$gt":"'"$SINCE"'"}'
   fi
-
   if [[ -n "$PROPS" ]]; then
-    # PROPS="k1=v1;k2=v2" → ajoute un bloc "@k1":{"$eq":"v1"} etc.
     IFS=';' read -r -a kvs <<<"$PROPS"
     for kv in "${kvs[@]}"; do
-      k="${kv%%=*}"; v="${kv#*=}"
-      AQL_FILTERS=$(echo "$AQL_FILTERS" | jq --arg k "$k" --arg v "$v" '. + {("@"+$k): {"$eq": $v}}')
+      local k="${kv%%=*}"; local v="${kv#*=}"
+      aql+=',"@'"$k"'":{"$eq":"'"$v"'"}'
     done
   fi
+  aql+='}).include("repo","path","name","sha1")'
+  printf "%s" "$aql"
+}
 
-  AQL=$(jq -cn --argjson f "$AQL_FILTERS" '
-    { "query": { "find": [$f] },
-      "options": { "include": ["name","repo","path"] } }'
-  )
+# =========================
+# API helpers
+# =========================
+aql_search() {
+  local aql="$1"
+  curl -sfSL -X POST "${auth_args[@]}" -H "Content-Type: text/plain" \
+    "$(api_base "search/aql")" \
+    --data-binary "$aql"
+}
 
-  echo ">> AQL query..."
-  MAPFILE -t ITEMS < <(curl -sfSL -X POST \
-      -H "Content-Type: text/plain" \
-      "${AUTH_HEADER[@]}" \
-      "${ARTI_URL%/}/api/search/aql" \
-      --data-binary "$AQL" \
-      | jq -r '.results[] | [.repo,.path,.name] | @tsv')
+copy_one() {
+  local src_repo="$1" src_rel="$2" dst_repo="$3" dst_dir="$4" dry="$5"
+  local src_enc dst_enc url
+  src_enc="$(urlenc "$src_rel")"
+  dst_enc="$(urlenc "${dst_repo}/${dst_dir}")"
+  url="$(api_base "copy/${src_repo}/${src_enc}")?to=${dst_enc}"
+  [[ "$dry" -eq 1 ]] && url="${url}&dry=1"
+  curl -sfSL -X POST "${auth_args[@]}" "$url" >/dev/null
+}
 
-  [[ ${#ITEMS[@]} -gt 0 ]] || { echo "Aucun artefact trouvé."; exit 0; }
+get_dst_sha1() {
+  # Récupère sha1 d'un artefact destination via AQL (renvoie vide si absent)
+  local repo="$1" path="$2" name="$3"
+  local aql='items.find({"repo":{"$eq":"'"$repo"'"},"path":{"$eq":"'"$path"'"},"name":{"$eq":"'"$name"'"}}).include("sha1")'
+  aql_search "$aql" | jq -r '.results[0].sha1 // empty'
+}
 
-  echo ">> ${#ITEMS[@]} artefacts trouvés. Copie vers ${TO} (dry=${DRY})"
-  TO_ENC="$(urlenc "$TO")"
-  ERR=0
+rewrite_path_if_needed() {
+  # applique --rewrite-from/--rewrite-to sur un "path" (pas le filename)
+  local in="$1"
+  if [[ -n "$REW_FROM" && -n "$REW_TO" ]]; then
+    printf '%s' "${in/$REW_FROM/$REW_TO}"
+  else
+    printf '%s' "$in"
+  fi
+}
 
-  for line in "${ITEMS[@]}"; do
-    repo=$(echo "$line" | awk -F'\t' '{print $1}')
-    path=$(echo "$line" | awk -F'\t' '{print $2}')
-    name=$(echo "$line" | awk -F'\t' '{print $3}')
-    src_rel="${path}/${name}"
-    src_rel="${src_rel#/}"  # normalize
-    src_enc="$(urlenc "$src_rel")"
+# =========================
+# Modes
+# =========================
+
+case "$MODE" in
+  folder)
+    # Copie récursive d'un dossier complet via /api/copy (1 appel)
+    SRC_PATH_ENC="$(urlenc "$SRC_PATH")"
+    TO_ENC="$(urlenc "$TO")"
     DRY_PARAM=$([[ $DRY -eq 1 ]] && echo "&dry=1" || echo "")
-    COPY_URL="${ARTI_URL%/}/api/copy/${repo}/${src_enc}?to=${TO_ENC}${DRY_PARAM}"
+    URL="$(api_base "copy/${SRC_REPO}/${SRC_PATH_ENC}")?to=${TO_ENC}${DRY_PARAM}"
+    echo ">> COPY FOLDER: ${FROM} -> ${TO} (dry=${DRY})"
+    curl -sfSL -X POST "${auth_args[@]}" "$URL"
+    echo; echo "OK"
+    ;;
 
-    echo " - ${repo}/${src_rel} → ${TO}"
-    if ! curl -sfSL -X POST "${AUTH_HEADER[@]}" "$COPY_URL" >/dev/null; then
-      echo "   !! échec copie: ${repo}/${src_rel}" >&2
-      ERR=1
-    fi
-  done
+  aql|aql-safe)
+    AQL="$(build_aql)"
+    echo ">> AQL search…"
+    RESP="$(aql_search "$AQL")"
+    COUNT="$(echo "$RESP" | jq '.results|length')"
+    echo ">> ${COUNT} artefacts trouvés"
+    [[ "$COUNT" -gt 0 ]] || exit 0
 
-  [[ $ERR -eq 0 ]] && echo "OK" || { echo "Terminé avec erreurs." ; exit 1; }
-fi
+    # Parcours sans MAPFILE en MAJ → while read
+    echo "$RESP" | jq -r '.results[] | [.repo,.path,.name,.sha1] | @tsv' | \
+    while IFS=$'\t' read -r repo path name sha1_src; do
+      # Calcul du path de destination (avec réécriture éventuelle)
+      new_path="$(rewrite_path_if_needed "$path")"
+      # Si l'utilisateur a fourni un DST_PATH (préfixe explicite), remplace le préfixe commun
+      # Ex: FROM=repoA/a/b  TO=repoB/x/y  => new_path = x/y + (suffix de path)
+      if [[ -n "$DST_PATH" && "$DST_PATH" != "." ]]; then
+        # Recompose un path relatif par rapport au SRC_PATH "racine logique"
+        # SRC_PATH peut être ".", sinon préfixe réel à ôter
+        base="${SRC_PATH:-.}"; [[ "$base" == "." ]] && base=""
+        suffix="$path"
+        [[ -n "$base" ]] && suffix="${path#${base}}"
+        suffix="${suffix#/}"
+        new_path="${DST_PATH%/}/${suffix}"
+        # puis réécriture éventuelle
+        new_path="$(rewrite_path_if_needed "$new_path")"
+      fi
 
+      src_rel="${path}/${name}"
+      echo " - ${SRC_REPO}/${src_rel} -> ${DST_REPO}/${new_path}/${name}"
 
---------------
+      if [[ "$MODE" == "aql-safe" ]]; then
+        sha1_dst="$(get_dst_sha1 "$DST_REPO" "$new_path" "$name" || true)"
+        if [[ -n "$sha1_dst" && "$sha1_dst" == "$sha1_src" ]]; then
+          echo "   = SKIP (sha1 identique)"
+          continue
+        fi
+      fi
 
-#!/usr/bin/env bash
-set -euo pipefail
+      copy_one "$SRC_REPO" "$src_rel" "$DST_REPO" "$new_path" "$DRY" || {
+        echo "   !! échec copie" >&2
+      }
+    done
+    echo "OK (mode=${MODE}, dry=${DRY})"
+    ;;
 
-ARTI_URL="${ARTI_URL:-https://artifactory.example.com}"
-ARTI_USER="${ARTI_USER:-}"          # si Basic
-ARTI_PASS="${ARTI_PASS:-}"          # si Basic
-ARTI_TOKEN="${ARTI_TOKEN:-}"        # Access Token ou Identity Token (Bearer)
-
-auth_args=()
-if [[ -n "$ARTI_TOKEN" ]]; then
-  auth_args=(-H "Authorization: Bearer ${ARTI_TOKEN}")
-elif [[ -n "$ARTI_USER" && -n "$ARTI_PASS" ]]; then
-  auth_args=(-u "${ARTI_USER}:${ARTI_PASS}")
-else
-  echo "ERR: ni token (ARTI_TOKEN) ni user/pass (ARTI_USER/ARTI_PASS) fournis." >&2
-  exit 1
-fi
-
-# ping
-curl -sfSL "${auth_args[@]}" "${ARTI_URL%/}/artifactory/api/system/ping"
-
-# exemple: copie dossier A -> B (récursif), dry-run
-SRC="libs-release-local/com/acme/app/branches/A"
-DST="libs-release-local/com/acme/app/branches/B"
-curl -sfSL "${auth_args[@]}" -X POST \
-  "${ARTI_URL%/}/artifactory/api/copy/${SRC}?to=${DST}&dry=1"
-
+  *)
+    usage; exit 1;;
+esac
