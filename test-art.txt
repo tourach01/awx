@@ -5,10 +5,9 @@ set -euo pipefail
 # Config / Auth
 # =========================
 ARTI_URL="${ARTI_URL:-https://artifactory.example.com}"
-# Choix de la base API:
-#   - "artifactory" => https://host/artifactory/api/...
-#   - "root"        => https://host/api/...
-ARTI_API_BASE="${ARTI_API_BASE:-artifactory}"   # ou "root"
+# "artifactory" => https://host/artifactory/api/...
+# "root"        => https://host/api/...
+ARTI_API_BASE="${ARTI_API_BASE:-artifactory}"
 
 ARTI_TOKEN="${ARTI_TOKEN:-}"   # Bearer (Access/Identity token)
 ARTI_USER="${ARTI_USER:-}"     # Basic
@@ -26,23 +25,17 @@ Usage:
   MODE 2: Copier un sous-ensemble via AQL (liste -> copy)
     artifactory-copy.sh aql --from REPO_A/path/prefix --to REPO_B/path/prefix \
       [--name-glob "*.jar"] [--since "YYYY-MM-DD"] [--props "k=v;k2=v2"] [--dry] \
-      [--rewrite-from "x86_64/7Server"] [--rewrite-to "x86_64/9Server"]
+      [--rewrite-from "A"] [--rewrite-to "B"]
 
-  MODE 3: AQL-SAFE (ne copie que si sha1 différent à destination)
+  MODE 3: AQL-SAFE (ignore sha1; compare taille & 'modified')
     artifactory-copy.sh aql-safe --from REPO_A/path/prefix --to REPO_B/path/prefix \
       [--name-glob "*.jar"] [--since "YYYY-MM-DD"] [--props "k=v;k2=v2"] [--dry] \
       [--rewrite-from "A"] [--rewrite-to "B"]
 
-Variables d'env:
-  ARTI_URL        : https://artifactory.exemple.com
-  ARTI_API_BASE   : "artifactory" (défaut) ou "root"
-  ARTI_TOKEN      : token Bearer
-  ARTI_USER/PASS  : user/pass (si pas de token)
-
 Notes:
-  - --dry exécute en "dry-run" côté /api/copy (param ?dry=1)
-  - --rewrite-from/--rewrite-to réécrivent le préfixe du path côté destination.
-    Ex: path source "x86_64/7Server/os" -> rewrite en "x86_64/9Server/os".
+  - --dry : active le dry-run côté /api/copy (?dry=1)
+  - --rewrite-from/--rewrite-to : remplace un préfixe de path côté destination.
+  - Écrasement (aql-safe) si: destination absente OU size différent OU source plus récente.
 EOF
 }
 
@@ -75,13 +68,22 @@ urlenc() {
   printf '%s' "$out"
 }
 
+to_epoch() {
+  # Convertit une date ISO en epoch (secondes). Renvoie vide si échec.
+  local d="$1"
+  [[ -z "$d" ]] && { echo ""; return; }
+  date -d "$d" +%s 2>/dev/null || echo ""
+}
+
 # =========================
 # Parse args
 # =========================
 MODE="${1:-}"; shift || true
 [[ -n "${MODE}" ]] || { usage; exit 1; }
 
-FROM=""; TO=""; NAME_GLOB=""; SINCE=""; PROPS=""; DRY=0; REW_FROM=""; REW_TO=""
+FROM=""; TO=""; NAME_GLOB=""; SINCE=""; PROPS=""
+DRY=0; REW_FROM=""; REW_TO=""
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --from) FROM="$2"; shift 2;;
@@ -108,13 +110,12 @@ DST_PATH="${TO#*/}"
 # AQL builder (items.find)
 # =========================
 build_aql() {
-  # Construit un AQL items.find(...) selon FROM + filtres
-  # path: match sur SRC_PATH + '*', racine = "."
   local pfx="$SRC_PATH"
   [[ -z "$pfx" ]] && pfx="."
   local aql='items.find({'
   aql+='"repo":{"$eq":"'"$SRC_REPO"'"},'
-  aql+='"path":{"$match":"'"$pfx"'*"}'
+  aql+='"path":{"$match":"'"$pfx"'*"},'
+  aql+='"type":{"$eq":"file"}'
   if [[ -n "$NAME_GLOB" ]]; then
     aql+=',"name":{"$match":"'"$NAME_GLOB"'"}'
   fi
@@ -128,7 +129,7 @@ build_aql() {
       aql+=',"@'"$k"'":{"$eq":"'"$v"'"}'
     done
   fi
-  aql+='}).include("repo","path","name","sha1")'
+  aql+='}).include("repo","path","name","size","modified","type")'
   printf "%s" "$aql"
 }
 
@@ -137,9 +138,9 @@ build_aql() {
 # =========================
 aql_search() {
   local aql="$1"
-  curl -sfSL -X POST "${auth_args[@]}" -H "Content-Type: text/plain" \
-    "$(api_base "search/aql")" \
-    --data-binary "$aql"
+  local url; url="$(api_base "search/aql")"
+  curl -ksfSL -X POST "${auth_args[@]}" -H "Content-Type: text/plain" \
+    "$url" --data-binary "$aql"
 }
 
 copy_one() {
@@ -149,18 +150,18 @@ copy_one() {
   dst_enc="$(urlenc "${dst_repo}/${dst_dir}")"
   url="$(api_base "copy/${src_repo}/${src_enc}")?to=${dst_enc}"
   [[ "$dry" -eq 1 ]] && url="${url}&dry=1"
-  curl -sfSL -X POST "${auth_args[@]}" "$url" >/dev/null
+  curl -ksfSL -X POST "${auth_args[@]}" "$url" >/dev/null
 }
 
-get_dst_sha1() {
-  # Récupère sha1 d'un artefact destination via AQL (renvoie vide si absent)
+get_dst_meta() {
+  # Renvoie "size<TAB>modified" ou vide si absent.
   local repo="$1" path="$2" name="$3"
-  local aql='items.find({"repo":{"$eq":"'"$repo"'"},"path":{"$eq":"'"$path"'"},"name":{"$eq":"'"$name"'"}}).include("sha1")'
-  aql_search "$aql" | jq -r '.results[0].sha1 // empty'
+  local aql='items.find({"repo":{"$eq":"'"$repo"'"},"path":{"$eq":"'"$path"'"},"name":{"$eq":"'"$name"'"}, "type":{"$eq":"file"}})'
+  aql+='.include("size","modified")'
+  aql_search "$aql" | jq -r 'if (.results|length)>0 then (.results[0].size|tostring)+"\t"+(.results[0].modified//"") else empty end'
 }
 
 rewrite_path_if_needed() {
-  # applique --rewrite-from/--rewrite-to sur un "path" (pas le filename)
   local in="$1"
   if [[ -n "$REW_FROM" && -n "$REW_TO" ]]; then
     printf '%s' "${in/$REW_FROM/$REW_TO}"
@@ -172,16 +173,14 @@ rewrite_path_if_needed() {
 # =========================
 # Modes
 # =========================
-
 case "$MODE" in
   folder)
-    # Copie récursive d'un dossier complet via /api/copy (1 appel)
     SRC_PATH_ENC="$(urlenc "$SRC_PATH")"
     TO_ENC="$(urlenc "$TO")"
     DRY_PARAM=$([[ $DRY -eq 1 ]] && echo "&dry=1" || echo "")
     URL="$(api_base "copy/${SRC_REPO}/${SRC_PATH_ENC}")?to=${TO_ENC}${DRY_PARAM}"
     echo ">> COPY FOLDER: ${FROM} -> ${TO} (dry=${DRY})"
-    curl -sfSL -X POST "${auth_args[@]}" "$URL"
+    curl -ksfSL -X POST "${auth_args[@]}" "$URL"
     echo; echo "OK"
     ;;
 
@@ -193,40 +192,57 @@ case "$MODE" in
     echo ">> ${COUNT} artefacts trouvés"
     [[ "$COUNT" -gt 0 ]] || exit 0
 
-    # Parcours sans MAPFILE en MAJ → while read
-    echo "$RESP" | jq -r '.results[] | [.repo,.path,.name,.sha1] | @tsv' | \
-    while IFS=$'\t' read -r repo path name sha1_src; do
-      # Calcul du path de destination (avec réécriture éventuelle)
-      new_path="$(rewrite_path_if_needed "$path")"
-      # Si l'utilisateur a fourni un DST_PATH (préfixe explicite), remplace le préfixe commun
-      # Ex: FROM=repoA/a/b  TO=repoB/x/y  => new_path = x/y + (suffix de path)
-      if [[ -n "$DST_PATH" && "$DST_PATH" != "." ]]; then
-        # Recompose un path relatif par rapport au SRC_PATH "racine logique"
-        # SRC_PATH peut être ".", sinon préfixe réel à ôter
-        base="${SRC_PATH:-.}"; [[ "$base" == "." ]] && base=""
-        suffix="$path"
-        [[ -n "$base" ]] && suffix="${path#${base}}"
-        suffix="${suffix#/}"
-        new_path="${DST_PATH%/}/${suffix}"
-        # puis réécriture éventuelle
-        new_path="$(rewrite_path_if_needed "$new_path")"
-      fi
-
-      src_rel="${path}/${name}"
-      echo " - ${SRC_REPO}/${src_rel} -> ${DST_REPO}/${new_path}/${name}"
-
-      if [[ "$MODE" == "aql-safe" ]]; then
-        sha1_dst="$(get_dst_sha1 "$DST_REPO" "$new_path" "$name" || true)"
-        if [[ -n "$sha1_dst" && "$sha1_dst" == "$sha1_src" ]]; then
-          echo "   = SKIP (sha1 identique)"
-          continue
+    echo "$RESP" \
+    | jq -r '.results[] | [.repo,.path,.name, (.size|tostring), (.modified//""), .type] | @tsv' \
+    | while IFS=$'\t' read -r repo path name size_src modified_src type; do
+        # path destination (avec réécriture éventuelle)
+        new_path="$(rewrite_path_if_needed "$path")"
+        if [[ -n "$DST_PATH" && "$DST_PATH" != "." ]]; then
+          base="${SRC_PATH:-.}"; [[ "$base" == "." ]] && base=""
+          suffix="$path"; [[ -n "$base" ]] && suffix="${path#${base}}"
+          suffix="${suffix#/}"
+          new_path="${DST_PATH%/}/${suffix}"
+          new_path="$(rewrite_path_if_needed "$new_path")"
         fi
-      fi
 
-      copy_one "$SRC_REPO" "$src_rel" "$DST_REPO" "$new_path" "$DRY" || {
-        echo "   !! échec copie" >&2
-      }
-    done
+        src_rel="${path}/${name}"
+        echo " - ${SRC_REPO}/${src_rel} -> ${DST_REPO}/${new_path}/${name}"
+
+        if [[ "$MODE" == "aql-safe" ]]; then
+          # Récupérer meta dest
+          meta_dst="$(get_dst_meta "$DST_REPO" "$new_path" "$name" || true)"
+          if [[ -n "$meta_dst" ]]; then
+            size_dst="$(cut -f1 <<<"$meta_dst")"
+            modified_dst="$(cut -f2 <<<"$meta_dst")"
+          else
+            size_dst=""; modified_dst=""
+          fi
+
+          # Décision: copier si dest absente OU size diff OU src plus récent
+          copy_needed=0
+          if [[ -z "$meta_dst" ]]; then
+            copy_needed=1
+          elif [[ "$size_src" != "$size_dst" ]]; then
+            copy_needed=1
+          else
+            # comparer modified (epoch); si parsing impossible, on ne copie pas si tailles identiques
+            src_epoch="$(to_epoch "$modified_src")"
+            dst_epoch="$(to_epoch "$modified_dst")"
+            if [[ -n "$src_epoch" && -n "$dst_epoch" && "$src_epoch" -gt "$dst_epoch" ]]; then
+              copy_needed=1
+            fi
+          fi
+
+          if [[ "$copy_needed" -eq 0 ]]; then
+            echo "   = SKIP (identique ou destination plus récente)"
+            continue
+          fi
+        fi
+
+        copy_one "$SRC_REPO" "$src_rel" "$DST_REPO" "$new_path" "$DRY" || {
+          echo "   !! échec copie" >&2
+        }
+      done
     echo "OK (mode=${MODE}, dry=${DRY})"
     ;;
 
