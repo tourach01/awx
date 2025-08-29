@@ -1,0 +1,21 @@
+copy_one() {
+  local src_repo="$1" src_rel="$2" dst_repo="$3" dst_dir="$4" dry="$5"
+  local src_enc dst_enc url code body
+  src_enc="$(urlenc "$src_rel")"
+  dst_enc="$(urlenc "${dst_repo}/${dst_dir}")"
+
+  # Ajoute failFast=0 pour qu’Artifactory n’arrête pas au 1er conflit
+  url="$(api_base "copy/${src_repo}/${src_enc}")?to=${dst_enc}&failFast=0"
+  [[ "$dry" -eq 1 ]] && url="${url}&dry=1"
+
+  # capture code + body
+  body="$(curl -sS -X POST "${auth_args[@]}" -w 'HTTP_CODE:%{http_code}' "$url")"
+  code="${body##*HTTP_CODE:}"
+  body="${body%HTTP_CODE:*}"
+
+  if [[ "$code" != "200" && "$code" != "201" ]]; then
+    echo "   !! copy HTTP $code"
+    [[ -n "$body" ]] && echo "   !! ${body}" | sed 's/^/   !! /'
+    return 1
+  fi
+}
