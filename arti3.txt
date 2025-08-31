@@ -376,3 +376,28 @@ case "$MODE" in
   *)
     usage; exit 1;;
 esac
+
+
+--------------
+
+echo "$RESP" | jq -r --arg repo "$SRC_REPO" --arg base "${SRC_PATH:-}" '
+  # L’API ?list renvoie "files"; folderInfo renvoie "children".
+  (.files // .children // []) as $items
+  | $items[]
+  | [
+      (.folder // false),
+      ((.size // 0) | tostring),
+      (.lastModified // ""),
+      (.uri | ltrimstr("/"))
+    ] | @tsv' \
+| while IFS=$'\t' read -r is_folder size modified uri; do
+    name="$uri"  # déjà normalisé
+    if [[ -z "${SRC_PATH:-}" || "${SRC_PATH:-}" == "." ]]; then
+      rel="$name"
+    else
+      rel="${SRC_PATH%/}/$name"
+    fi
+    type=$([[ "$is_folder" == "true" ]] && echo "d" || echo "-")
+    printf "%s\t%10s\t%s\t%s/%s\n" "$type" "$size" "$modified" "$SRC_REPO" "$rel"
+  done
+
