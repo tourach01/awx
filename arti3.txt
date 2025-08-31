@@ -1,0 +1,378 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =========================
+# Config / Auth
+# =========================
+ARTI_URL="${ARTI_URL:-https://artifactory.example.com}"
+# "artifactory" => https://host/artifactory/api/...
+# "root"        => https://host/api/...
+ARTI_API_BASE="${ARTI_API_BASE:-artifactory}"
+
+ARTI_TOKEN="${ARTI_TOKEN:-}"   # Bearer (Access/Identity token)
+ARTI_USER="${ARTI_USER:-}"     # Basic
+ARTI_PASS="${ARTI_PASS:-}"     # Basic
+
+# =========================
+# Helpers
+# =========================
+usage() {
+  cat <<'EOF'
+Usage:
+  # === LISTING (afficher le contenu d'un repo/dossier) ===
+  artifactory-copy.sh ls --from REPO[/path] [--recursive]
+
+  # === UPLOAD (fichier local -> repo) ===
+  artifactory-copy.sh upload --file /chemin/local.ext --to REPO/path/remote.ext [--props "k=v;k2=v2"]
+
+  # === DOWNLOAD (repo -> fichier local) ===
+  artifactory-copy.sh download --from REPO/path/remote.ext [--out /chemin/local.ext]
+
+  # === COPIE (déjà existants dans tes versions précédentes) ===
+  artifactory-copy.sh folder --from REPO_A/path/source --to REPO_B/path/dest [--dry]
+  artifactory-copy.sh aql    --from REPO_A/path/prefix --to REPO_B/path/prefix \
+      [--name-glob "*.jar"] [--since "YYYY-MM-DD"] [--props "k=v;k2=v2"] [--dry] \
+      [--rewrite-from "A"] [--rewrite-to "B"]
+
+  # AQL-SAFE (ignore SHA1; compare taille & 'modified'):
+  artifactory-copy.sh aql-safe --from REPO_A/path/prefix --to REPO_B/path/prefix \
+      [--name-glob "*.jar"] [--since "YYYY-MM-DD"] [--props "k=v;k2=v2"] [--dry] \
+      [--rewrite-from "A"] [--rewrite-to "B"]
+
+Variables d'env:
+  ARTI_URL        : https://artifactory.exemple.com
+  ARTI_API_BASE   : "artifactory" (défaut) ou "root"
+  ARTI_TOKEN      : token Bearer
+  ARTI_USER/PASS  : user/pass (si pas de token)
+
+Notes:
+  - --dry : active le dry-run côté /api/copy (?dry=1)
+  - --rewrite-from/--rewrite-to : remplace un préfixe de path côté destination.
+  - AQL-SAFE : copie si dest absente OU size différent OU source plus récente.
+  - 'ls' utilise l'API storage ?list (immediate par défaut, --recursive pour deep=1).
+EOF
+}
+
+die(){ echo "ERR: $*" >&2; exit 1; }
+
+auth_args=()
+if [[ -n "$ARTI_TOKEN" ]]; then
+  auth_args=(-H "Authorization: Bearer ${ARTI_TOKEN}")
+elif [[ -n "${ARTI_USER}" && -n "${ARTI_PASS}" ]]; then
+  auth_args=(-u "${ARTI_USER}:${ARTI_PASS}")
+else
+  die "Fournis ARTI_TOKEN ou ARTI_USER/ARTI_PASS"
+fi
+
+api_base() {
+  local path="$1" # ex: "search/aql"
+  if [[ "$ARTI_API_BASE" == "root" ]]; then
+    printf "%s/api/%s" "${ARTI_URL%/}" "$path"
+  else
+    printf "%s/artifactory/api/%s" "${ARTI_URL%/}" "$path"
+  fi
+}
+
+content_base() {
+  # Base pour accès direct contenu (upload/download)
+  if [[ "$ARTI_API_BASE" == "root" ]]; then
+    printf "%s" "${ARTI_URL%/}"
+  else
+    printf "%s/artifactory" "${ARTI_URL%/}"
+  fi
+}
+
+urlenc() {
+  local s="$1" out="" c
+  for ((i=0;i<${#s};i++)); do
+    c="${s:i:1}"
+    [[ "$c" =~ [a-zA-Z0-9.~_-] ]] && out+="$c" || printf -v out '%s%%%02X' "$out" "'$c"
+  done
+  printf '%s' "$out"
+}
+
+to_epoch() {
+  local d="$1"
+  [[ -z "$d" ]] && { echo ""; return; }
+  date -d "$d" +%s 2>/dev/null || echo ""
+}
+
+# Matrix properties (upload) : "k=v;k2=v2" -> ;k=v;k2=v2
+matrix_props() {
+  local p="$1"
+  [[ -z "$p" ]] && { echo ""; return; }
+  local out=""; local IFS=';'
+  read -r -a kvs <<<"$p"
+  for kv in "${kvs[@]}"; do
+    [[ -z "$kv" ]] && continue
+    out="${out};${kv}"
+  done
+  printf '%s' "$out"
+}
+
+# =========================
+# Parse args
+# =========================
+MODE="${1:-}"; shift || true
+[[ -n "${MODE}" ]] || { usage; exit 1; }
+
+FROM=""; TO=""; NAME_GLOB=""; SINCE=""; PROPS=""
+DRY=0; REW_FROM=""; REW_TO=""; RECURSIVE=0
+LOCAL_FILE=""; OUT_FILE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --from) FROM="$2"; shift 2;;
+    --to) TO="$2"; shift 2;;
+    --name-glob) NAME_GLOB="$2"; shift 2;;
+    --since) SINCE="$2"; shift 2;;
+    --props) PROPS="$2"; shift 2;;
+    --dry) DRY=1; shift;;
+    --rewrite-from) REW_FROM="$2"; shift 2;;
+    --rewrite-to) REW_TO="$2"; shift 2;;
+    --recursive) RECURSIVE=1; shift;;
+    --file) LOCAL_FILE="$2"; shift 2;;
+    --out) OUT_FILE="$2"; shift 2;;
+    -h|--help) usage; exit 0;;
+    *) echo "Arg inconnu: $1"; usage; exit 1;;
+  esac
+done
+
+# Découpage FROM/TO en repo/path (si présents)
+SRC_REPO=""; SRC_PATH=""
+DST_REPO=""; DST_PATH=""
+if [[ -n "$FROM" ]]; then
+  SRC_REPO="${FROM%%/*}"
+  SRC_PATH="${FROM#*/}"
+  [[ "$SRC_REPO" == "$SRC_PATH" ]] && SRC_PATH=""  # pas de slash -> pas de path
+fi
+if [[ -n "$TO" ]]; then
+  DST_REPO="${TO%%/*}"
+  DST_PATH="${TO#*/}"
+  [[ "$DST_REPO" == "$DST_PATH" ]] && DST_PATH=""  # pas de path
+fi
+
+# =========================
+# AQL builder (items.find)
+# =========================
+build_aql() {
+  local pfx="$SRC_PATH"
+  [[ -z "$pfx" ]] && pfx="."
+  local aql='items.find({'
+  aql+='"repo":{"$eq":"'"$SRC_REPO"'"},'
+  aql+='"path":{"$match":"'"$pfx"'*"},'
+  aql+='"type":{"$eq":"file"}'
+  if [[ -n "$NAME_GLOB" ]]; then
+    aql+=',"name":{"$match":"'"$NAME_GLOB"'"}'
+  fi
+  if [[ -n "$SINCE" ]]; then
+    aql+=',"modified":{"$gt":"'"$SINCE"'"}'
+  fi
+  if [[ -n "$PROPS" ]]; then
+    IFS=';' read -r -a kvs <<<"$PROPS"
+    for kv in "${kvs[@]}"; do
+      local k="${kv%%=*}"; local v="${kv#*=}"
+      aql+=',"@'"$k"'":{"$eq":"'"$v"'"}'
+    done
+  fi
+  aql+='}).include("repo","path","name","size","modified","type")'
+  printf "%s" "$aql"
+}
+
+# =========================
+# API helpers
+# =========================
+aql_search() {
+  local aql="$1"
+  local url; url="$(api_base "search/aql")"
+  curl -ksfSL -X POST "${auth_args[@]}" -H "Content-Type: text/plain" \
+    "$url" --data-binary "$aql"
+}
+
+copy_one() {
+  local src_repo="$1" src_rel="$2" dst_repo="$3" dst_dir="$4" dry="$5"
+  local src_enc dst_enc url code body
+  src_enc="$(urlenc "$src_rel")"
+  dst_enc="$(urlenc "${dst_repo}/${dst_dir}")"
+  url="$(api_base "copy/${src_repo}/${src_enc}")?to=${dst_enc}&failFast=0"
+  [[ "$dry" -eq 1 ]] && url="${url}&dry=1"
+  body="$(curl -ksS -X POST "${auth_args[@]}" -w 'HTTP_CODE:%{http_code}' "$url")"
+  code="${body##*HTTP_CODE:}"
+  body="${body%HTTP_CODE:*}"
+  if [[ "$code" == "409" ]]; then
+    echo "   = SKIP (déjà présent, pas de droit delete)"
+    return 0
+  fi
+  if [[ "$code" != "200" && "$code" != "201" ]]; then
+    echo "   !! copy HTTP $code"
+    [[ -n "$body" ]] && echo "   !! ${body}" | sed 's/^/   !! /'
+    return 1
+  fi
+}
+
+get_dst_meta() {
+  # Renvoie "size<TAB>modified" ou vide si absent (fichier)
+  local repo="$1" path="$2" name="$3"
+  local aql='items.find({"repo":{"$eq":"'"$repo"'"},"path":{"$eq":"'"$path"'"},"name":{"$eq":"'"$name"'"}, "type":{"$eq":"file"}})'
+  aql+='.include("size","modified")'
+  aql_search "$aql" | jq -r 'if (.results|length)>0 then (.results[0].size|tostring)+"\t"+(.results[0].modified//"") else empty end'
+}
+
+rewrite_path_if_needed() {
+  local in="$1"
+  if [[ -n "$REW_FROM" && -n "$REW_TO" ]]; then
+    printf '%s' "${in/$REW_FROM/$REW_TO}"
+  else
+    printf '%s' "$in"
+  fi
+}
+
+# === LIST (storage ?list) ===
+storage_list() {
+  local repo="$1" path="$2" deep="$3"
+  local base; base="$(api_base "storage/${repo}")"
+  local url
+  if [[ -n "$path" && "$path" != "." ]]; then
+    url="${base}/$(urlenc "$path")?list&deep=${deep}&mdTimestamps=1&listFolders=1"
+  else
+    url="${base}?list&deep=${deep}&mdTimestamps=1&listFolders=1"
+  fi
+  curl -ksfSL "${auth_args[@]}" "$url"
+}
+
+# === UPLOAD (PUT contenu) ===
+upload_file() {
+  local local_file="$1" dest="$2" props="$3"
+  [[ -f "$local_file" ]] || die "Fichier local introuvable: $local_file"
+  local repo="${dest%%/*}" rest="${dest#*/}"
+  [[ "$repo" == "$rest" ]] && die "--to doit être REPO/path/filename"
+  local matrix; matrix="$(matrix_props "$props")"
+  local url; url="$(content_base)/${repo}/$(urlenc "$rest")${matrix}"
+  echo ">> UPLOAD: $local_file -> ${repo}/${rest}"
+  curl -ksfSL -X PUT "${auth_args[@]}" -T "$local_file" "$url" >/dev/null
+  echo "OK"
+}
+
+# === DOWNLOAD (GET contenu) ===
+download_file() {
+  local from="$1" out="$2"
+  local repo="${from%%/*}" rest="${from#*/}"
+  [[ "$repo" == "$rest" ]] && die "--from doit être REPO/path/filename"
+  local url; url="$(content_base)/${repo}/$(urlenc "$rest")"
+  [[ -z "$out" ]] && out="$(basename "$rest")"
+  mkdir -p "$(dirname "$out")"
+  echo ">> DOWNLOAD: ${repo}/${rest} -> $out"
+  curl -ksfSL "${auth_args[@]}" -o "$out" "$url"
+  echo "OK"
+}
+
+# =========================
+# Modes
+# =========================
+case "$MODE" in
+  ls)
+    [[ -n "$SRC_REPO" ]] || die "--from REPO[/path] requis"
+    deep=$([[ $RECURSIVE -eq 1 ]] && echo 1 || echo 0)
+    RESP="$(storage_list "$SRC_REPO" "${SRC_PATH:-}" "$deep")"
+    # Affichage style "ls" (type, size, modified, repo/path)
+    echo "$RESP" | jq -r --arg repo "$SRC_REPO" --arg base "${SRC_PATH:-}" '
+      .children[]
+      | [.folder, (.size // 0 | tonumber), (.lastModified // ""), .uri]
+      | @tsv' \
+    | while IFS=$'\t' read -r is_folder size modified uri; do
+        # uri commence par "/name"
+        name="${uri#/}"
+        # chemin affiché
+        if [[ -z "${SRC_PATH:-}" || "${SRC_PATH:-}" == "." ]]; then
+          rel="$name"
+        else
+          rel="${SRC_PATH%/}/$name"
+        fi
+        type=$([[ "$is_folder" == "true" ]] && echo "d" || echo "-")
+        printf "%s\t%10s\t%s\t%s\n" "$type" "$size" "$modified" "${SRC_REPO}/${rel}"
+      done
+    ;;
+
+  upload)
+    [[ -n "$LOCAL_FILE" && -n "$TO" ]] || die "--file et --to requis"
+    upload_file "$LOCAL_FILE" "$TO" "$PROPS"
+    ;;
+
+  download)
+    [[ -n "$FROM" ]] || die "--from requis (REPO/path/name)"
+    download_file "$FROM" "$OUT_FILE"
+    ;;
+
+  folder)
+    [[ -n "$FROM" && -n "$TO" ]] || die "--from et --to requis"
+    SRC_PATH_ENC="$(urlenc "$SRC_PATH")"
+    TO_ENC="$(urlenc "$TO")"
+    DRY_PARAM=$([[ $DRY -eq 1 ]] && echo "&dry=1" || echo "")
+    URL="$(api_base "copy/${SRC_REPO}/${SRC_PATH_ENC}")?to=${TO_ENC}${DRY_PARAM}"
+    echo ">> COPY FOLDER: ${FROM} -> ${TO} (dry=${DRY})"
+    curl -ksfSL -X POST "${auth_args[@]}" "$URL"
+    echo; echo "OK"
+    ;;
+
+  aql|aql-safe)
+    [[ -n "$FROM" && -n "$TO" ]] || die "--from et --to requis"
+    AQL="$(build_aql)"
+    echo ">> AQL search…"
+    RESP="$(aql_search "$AQL")"
+    COUNT="$(echo "$RESP" | jq '.results|length')"
+    echo ">> ${COUNT} artefacts trouvés"
+    [[ "$COUNT" -gt 0 ]] || exit 0
+
+    echo "$RESP" \
+    | jq -r '.results[] | [.repo,.path,.name, (.size|tostring), (.modified//""), .type] | @tsv' \
+    | while IFS=$'\t' read -r repo path name size_src modified_src type; do
+        new_path="$(rewrite_path_if_needed "$path")"
+        if [[ -n "$DST_PATH" && "$DST_PATH" != "." ]]; then
+          base="${SRC_PATH:-.}"; [[ "$base" == "." ]] && base=""
+          suffix="$path"; [[ -n "$base" ]] && suffix="${path#${base}}"
+          suffix="${suffix#/}"
+          new_path="${DST_PATH%/}/${suffix}"
+          new_path="$(rewrite_path_if_needed "$new_path")"
+        fi
+
+        src_rel="${path}/${name}"
+        echo " - ${SRC_REPO}/${src_rel} -> ${DST_REPO}/${new_path}/${name}"
+
+        if [[ "$MODE" == "aql-safe" ]]; then
+          meta_dst="$(get_dst_meta "$DST_REPO" "$new_path" "$name" || true)"
+          if [[ -n "$meta_dst" ]]; then
+            size_dst="$(cut -f1 <<<"$meta_dst")"
+            modified_dst="$(cut -f2 <<<"$meta_dst")"
+          else
+            size_dst=""; modified_dst=""
+          fi
+
+          copy_needed=0
+          if [[ -z "$meta_dst" ]]; then
+            copy_needed=1
+          elif [[ "$size_src" != "$size_dst" ]]; then
+            copy_needed=1
+          else
+            src_epoch="$(to_epoch "$modified_src")"
+            dst_epoch="$(to_epoch "$modified_dst")"
+            if [[ -n "$src_epoch" && -n "$dst_epoch" && "$src_epoch" -gt "$dst_epoch" ]]; then
+              copy_needed=1
+            fi
+          fi
+
+          if [[ "$copy_needed" -eq 0 ]]; then
+            echo "   = SKIP (identique ou destination plus récente)"
+            continue
+          fi
+        fi
+
+        copy_one "$SRC_REPO" "$src_rel" "$DST_REPO" "$new_path" "$DRY" || {
+          echo "   !! échec copie" >&2
+        }
+      done
+    echo "OK (mode=${MODE}, dry=${DRY})"
+    ;;
+
+  *)
+    usage; exit 1;;
+esac
