@@ -400,4 +400,31 @@ echo "$RESP" | jq -r --arg repo "$SRC_REPO" --arg base "${SRC_PATH:-}" '
     type=$([[ "$is_folder" == "true" ]] && echo "d" || echo "-")
     printf "%s\t%10s\t%s\t%s/%s\n" "$type" "$size" "$modified" "$SRC_REPO" "$rel"
   done
+-------------------
+
+- name: "Télécharger l'artifact depuis Artifactory"
+  ansible.builtin.get_url:
+    url: "{{ url if url is match('^https?://') else art_base_url ~ '/' ~ url }}"
+    dest: "{{ dest }}"
+    mode: "{{ mode | default('0644') }}"
+    checksum: "{{ checksum | default(omit) }}"
+    headers: "{{ art_headers_default | combine(headers | default({})) }}"
+    validate_certs: "{{ validate_certs | default(true) }}"
+    force: "{{ force | default(false) }}"
+    timeout: "{{ timeout | default(60) }}"
+    use_etag: "{{ use_etag | default(true) }}"
+    use_last_modified: "{{ use_last_modified | default(true) }}"
+    # Si 'dest' est un dossier, autorise le nom basé sur l'URL :
+    # (dans les versions récentes, get_url gère tout seul si dest finit par '/')
+    # on force le comportement via ce bool :
+    # NB: si filename_in_url omis, pas d'effet.
+    # (Astuce: si filename_in_url=true, assure-toi que dest est un dossier.)
+    url_username: "{{ url_username | default(omit) }}"
+    url_password: "{{ url_password | default(omit) }}"
+  register: _dl
+  retries: 3
+  delay: 2
+  until: _dl is succeeded
+
+
 
