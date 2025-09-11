@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+set -euo pipefail
+command -v jq >/dev/null 2>&1 || { echo "Erreur: jq est requis." >&2; exit 2; }
+
+# --- Defaults ---
+OS_URL="https://localhost:9200"
+OS_INDEX="docs"
+AUTH=""
+APIKEY="${OS_APIKEY:-}"
+INSECURE=1          # -k par défaut
+PRETTY=0
+CREATE_INDEX=0      # pas de création auto
+REFRESH="wait_for"
+MODE="index"        # index | update | updateq | search
+DEBUG=0
+
+# Insertion / Update par _id
+DOC_ID=""
+UPSERT=0
+
+# Update/Search par requête
+QSTRING=""
+MAX_DOCS=""
+CONFLICTS="abort"
+UBQ_REFRESH="true"
+
+# Search options
+SIZE=10
+FROM=0
+SORT=""
+SRC_INCLUDES=""
+SRC_EXCLUDES=""
+
+# Sorties search “1 doc par ligne”
+ROWS=0             # --rows : NDJSON
+KV=0               # --kv   : "k=v" par ligne
+DELIM=$'\t'        # séparateur pour --kv (tab par défaut)
+
+# Champs (set) et suppressions (unset)
+FIELDS_SPECS=()
+UNSETS=()
+
+usage() {
+  cat <<'EOF'
+Usage (insertion):
+  os_doc.sh [...] [--create] [-r refresh] [--id ID] -F k=v | -F k:=JSON | --fields "k=v,k2:=JSON"
+
+Update par _id:
+  os_doc.sh --update --id ID [...] [-F k=v | -F k:=JSON | --fields "..."] [-U champ | --unset "a,b"] [--upsert]
+
+Update par requête:
+  os_doc.sh --update-by-query -q "..." [...] [-F/--fields ...] [-U/--unset ...] [--max-docs N] [--conflicts proceed|abort] [--ubq-refresh true|false]
+
+Recherche:
+  os_doc.sh --search -q "..." [...] [--size N] [--from N] [--sort field:asc]
+            [--source-includes f1,f2 | --sources-includes f1,f2] [--source-excludes g1,g2]
+            [--rows | --kv [--delim ';' ]]
+
+Options communes:
+  -e URL             (def: https://localhost:9200)
+  -i INDEX           (def: docs)
+  -a user:pass       ou OS_APIKEY via env
+  --secure | --cacert FILE
+  -P                 pretty=true
+  --debug            affiche curl + en-têtes + corps
+EOF
+}
+
+# --- Parse args ---
+FIELDS_LIST=""; UNSET_LIST=""; CACERT=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --update) MODE="update";;
+    --update-by-query) MODE="updateq";;
+    --search) MODE="search";;
+    -e) OS_URL="$2"; shift;;
+    -i) OS_INDEX="$2"; shift;;
+    -a) AUTH="$2"; shift;;
+    --secure) INSECURE=0;;
+    --cacert) CACERT="$2"; shift;;
+    -P) PRETTY=1;;
+    --debug) DEBUG=1;;
+    -r) REFRESH="$2"; shift;;
+    --create) CREATE_INDEX=1;;
+    --id) DOC_ID="$2"; shift;;
+    --upsert) UPSERT=1;;
+    -F) FIELDS_SPECS+=("$2"); shift;;
+    --fields) FIELDS_LIST="$2"; shift;;
+    -U) UNSETS+=("$2"); shift;;
+    --unset) UNSET_LIST="$2"; shift;;
+    -q|--query) QSTRING="$2"; shift;;
+    --max-docs) MAX_DOCS="$2"; shift;;
+    --conflicts) CONFLICTS="$2"; shift;;
+    --ubq-refresh) UBQ_REFRESH="$2"; shift;;
+    --size) SIZE="$2"; shift;;
+    --from) FROM="$2"; shift;;
+    --sort) SORT="$2"; shift;;
+    --source-includes|--sources-includes) SRC_INCLUDES="$2"; shift;;
+    --source-excludes) SRC_EXCLUDES="$2"; shift;;
+    --rows) ROWS=1;;
+    --kv) KV=1;;
+    --delim) DELIM="$2"; shift;;
+    -h|--help) usage; exit 0;;
+    *) echo "Arg inconnu: $1"; usage; exit 1;;
+  esac
+  shift
+done
+
+# --fields -> FIELDS_SPECS
+if [[ -n "$FIELDS_LIST" ]]; then
+  IFS=',' read -r -a _tmp <<< "$FIELDS_LIST"
+  for t in "${_tmp[@]}"; do
+    t="${t#"${t%%[![:space:]]*}"}"; t="${t%"${t##*[![:space:]]}"}"
+    [[ -z "$t" ]] || FIELDS_SPECS+=("$t")
+  done
+fi
+# --unset "a,b"
+if [[ -n "$UNSET_LIST" ]]; then
+  IFS=',' read -r -a _u <<< "$UNSET_LIST"
+  for u in "${_u[@]}"; do
+    u="${u#"${u%%[![:space:]]*}"}"; u="${u%"${u##*[![:space:]]}"}"
+    [[ -z "$u" ]] || UNSETS+=("$u")
+  done
+fi
+
+# --- Curl helpers ---
+CURL_OPTS=( -sS )
+(( INSECURE )) && CURL_OPTS+=( -k )
+[[ -n "$CACERT" ]] && CURL_OPTS+=( --cacert "$CACERT" )
+HEADERS=( -H "Content-Type: application/json" )
+if [[ -n "$APIKEY" ]]; then
+  HEADERS+=( -H "Authorization: ApiKey $APIKEY" )
+elif [[ -n "$AUTH" ]]; then
+  CURL_OPTS+=( -u "$AUTH" )
+fi
+
+mask_auth(){ local v="$AUTH"; [[ -z "$v" ]]&&{ echo "";return;}; echo "${v%%:*}:******"; }
+mask_apikey(){ local v="$APIKEY"; local n=${#v}; ((n>8))&&echo "${v:0:4}****${v:n-4:4}"||echo "****"; }
+
+CURL_OPTS_PRINT=( "${CURL_OPTS[@]}" )
+for ((i=0;i<${#CURL_OPTS_PRINT[@]};i++)); do
+  if [[ "${CURL_OPTS_PRINT[$i]}" == "-u" && $((i+1)) -lt ${#CURL_OPTS_PRINT[@]} ]]; then
+    CURL_OPTS_PRINT[$((i+1))]="$(mask_auth)"
+  fi
+done
+HEADERS_PRINT=()
+for h in "${HEADERS[@]}"; do
+  if [[ "$h" == -H*Authorization:*ApiKey* ]]; then
+    HEADERS_PRINT+=( -H "Authorization: ApiKey $(mask_apikey)" )
+  else
+    HEADERS_PRINT+=( "$h" )
+  fi
+done
+(( DEBUG )) && CURL_OPTS+=( -i )
+
+http_code(){ curl "${CURL_OPTS[@]}" -o /dev/null -w '%{http_code}' "$@"; }
+http_json(){
+  local args=( "$@" )
+  (( DEBUG )) && echo ">>> curl ${CURL_OPTS_PRINT[*]} ${HEADERS_PRINT[*]} ${args[*]}" >&2
+  curl "${CURL_OPTS[@]}" "${HEADERS[@]}" "${args[@]}"
+}
+# Variante sans -i (pour parser proprement la réponse)
+http_json_capture(){
+  local args=( "$@" )
+  local no_i=()
+  for x in "${CURL_OPTS[@]}"; do [[ "$x" == "-i" ]] || no_i+=( "$x" ); done
+  (( DEBUG )) && echo ">>> curl ${no_i[*]} ${HEADERS_PRINT[*]} ${args[*]}" >&2
+  curl "${no_i[@]}" "${HEADERS[@]}" "${args[@]}"
+}
+
+# --- Helpers JSON build ---
+ensure_index_for_indexing(){
+  local code; code=$(http_code -X HEAD "$OS_URL/$OS_INDEX")
+  if [[ "$code" == "404" ]]; then
+    if (( CREATE_INDEX )); then
+      echo "Création de l'index '$OS_INDEX'…" >&2
+      http_json -X PUT "$OS_URL/$OS_INDEX" --data-binary @- <<'JSON' >/dev/null
+{"settings":{"number_of_shards":1,"number_of_replicas":0}}
+JSON
+    else
+      echo "Index '$OS_INDEX' absent (création désactivée). Utilise --create si besoin." >&2
+      exit 1
+    fi
+  fi
+}
+
+build_set_object_json(){
+  local jq_filter='{}'; local -a jq_args=(); local idx=0
+  for spec in "${FIELDS_SPECS[@]:-}"; do
+    if [[ "$spec" =~ ^([^:=]+):=(.*)$ ]]; then
+      local k="${BASH_REMATCH[1]}" v="${BASH_REMATCH[2]}"
+      jq_args+=( --arg "k$idx" "$k" --argjson "v$idx" "$v" )
+      jq_filter+=" | .[\$k$idx] = \$v$idx"
+    elif [[ "$spec" =~ ^([^=]+)=(.*)$ ]]; then
+      local k="${BASH_REMATCH[1]}" v="${BASH_REMATCH[2]}"
+      jq_args+=( --arg "k$idx" "$k" --arg "v$idx" "$v" )
+      jq_filter+=" | .[\$k$idx] = \$v$idx"
+    else
+      echo "Format de champ invalide: '$spec' (attendu k=v ou k:=JSON)" >&2; exit 1
+    fi
+    ((idx++))
+  done
+  jq -n "${jq_args[@]}" "$jq_filter"
+}
+
+build_unset_array_json(){ [[ ${#UNSETS[@]} -eq 0 ]] && echo "null" || jq -n --args "${UNSETS[@]}" '$ARGS.positional'; }
+
+build_update_script_single_body(){
+  local set_json unset_json; set_json="$(build_set_object_json)"; unset_json="$(build_unset_array_json)"
+  [[ "$set_json" == "{}" && "$unset_json" == "null" ]] && { echo "Erreur: rien à set/unset." >&2; exit 1; }
+  local script_src='
+    if (params.set != null) { for (entry in params.set.entrySet()) { ctx._source[entry.getKey()] = entry.getValue(); } }
+    if (params.unset != null) { for (f in params.unset) { ctx._source.remove(f); } }'
+  jq -n --arg src "$script_src" --argjson set "$set_json" --argjson unset "$unset_json" \
+        --argjson upsert_do $([[ $UPSERT -eq 1 ]] && echo true || echo false) \
+        --argjson upsert_doc "$set_json" '
+    ( { script: { lang:"painless", source:$src, params:{ set: ( ($set|length==0)? null : $set ), unset:$unset } } } )
+    + ( $upsert_do ? { upsert: ( ($upsert_doc|length==0) ? {} : $upsert_doc ) } : {} )'
+}
+
+build_update_by_query_body(){
+  local set_json unset_json; set_json="$(build_set_object_json)"; unset_json="$(build_unset_array_json)"
+  [[ "$set_json" == "{}" && "$unset_json" == "null" ]] && { echo "Erreur: rien à set/unset." >&2; exit 1; }
+  local script_src='
+    if (params.set != null) { for (entry in params.set.entrySet()) { ctx._source[entry.getKey()] = entry.getValue(); } }
+    if (params.unset != null) { for (f in params.unset) { ctx._source.remove(f); } }'
+  jq -n --arg q "$QSTRING" --arg src "$script_src" --argjson set "$set_json" --argjson unset "$unset_json" '
+    { query:{ query_string:{ query:$q, default_operator:"AND" } },
+      script:{ lang:"painless", source:$src, params:{ set:( ($set|length==0)? null : $set ), unset:$unset } } }'
+}
+
+build_search_body(){
+  local field="${SORT%%:*}" order="${SORT##*:}"; [[ "$field" == "$order" ]] && field=""
+  if [[ -n "$field" ]]; then
+    jq -n --arg q "$QSTRING" --argjson from "$FROM" --argjson size "$SIZE" --arg field "$field" --arg order "${order:-asc}" '
+      { query:{ query_string:{ query:$q, default_operator:"AND" } }, from:$from, size:$size,
+        sort:[ { ($field):{ order:( ($order=="desc")?"desc":"asc" ) } } ] }'
+  else
+    jq -n --arg q "$QSTRING" --argjson from "$FROM" --argjson size "$SIZE" '
+      { query:{ query_string:{ query:$q, default_operator:"AND" } }, from:$from, size:$size }'
+  fi
+}
+
+# --- Main ---
+QS=""; (( PRETTY )) && QS="${QS:+$QS&}pretty=true"
+
+case "$MODE" in
+  index)
+    ensure_index_for_indexing
+    QS="${QS:+$QS&}refresh=${REFRESH}"
+    SET_JSON="$(build_set_object_json)"
+    (( DEBUG )) && { echo ">>> BODY (index):" >&2; echo "$SET_JSON" | jq . >&2 || echo "$SET_JSON" >&2; }
+    if [[ -z "$DOC_ID" ]]; then
+      http_json -X POST "$OS_URL/$OS_INDEX/_doc?${QS}" --data-binary "$SET_JSON"
+    else
+      http_json -X PUT "$OS_URL/$OS_INDEX/_doc/$DOC_ID?${QS}" --data-binary "$SET_JSON"
+    fi
+    echo
+    ;;
+  update)
+    [[ -z "$DOC_ID" ]] && { echo "Erreur: --update nécessite --id." >&2; exit 1; }
+    BODY="$(build_update_script_single_body)"
+    (( DEBUG )) && { echo ">>> BODY (update _id=$DOC_ID):" >&2; echo "$BODY" | jq . >&2 || echo "$BODY" >&2; }
+    http_json -X POST "$OS_URL/$OS_INDEX/_update/$DOC_ID?${QS}${QS:+&}refresh=${REFRESH}" --data-binary "$BODY"
+    echo
+    ;;
+  updateq)
+    [[ -z "$QSTRING" ]] && { echo "Erreur: --update-by-query nécessite -q/--query." >&2; exit 1; }
+    BODY="$(build_update_by_query_body)"
+    UQS="conflicts=$( [[ "$CONFLICTS" == "proceed" ]] && echo proceed || echo abort )"
+    UQS+="&refresh=$( [[ "$UBQ_REFRESH" == "true" ]] && echo true || echo false )"
+    [[ -n "$MAX_DOCS" ]] && UQS+="&max_docs=$MAX_DOCS"
+    (( PRETTY )) && UQS+="&pretty=true"
+    (( DEBUG )) && { echo ">>> BODY (update_by_query):" >&2; echo "$BODY" | jq . >&2 || echo "$BODY" >&2; }
+    http_json -X POST "$OS_URL/$OS_INDEX/_update_by_query?${UQS}" --data-binary "$BODY"
+    echo
+    ;;
+  search)
+    [[ -z "$QSTRING" ]] && { echo "Erreur: --search nécessite -q/--query." >&2; exit 1; }
+    BODY="$(build_search_body)"
+    [[ -n "$SRC_INCLUDES" ]] && QS="${QS:+$QS&}_source_includes=$SRC_INCLUDES"
+    [[ -n "$SRC_EXCLUDES" ]] && QS="${QS:+$QS&}_source_excludes=$SRC_EXCLUDES"
+    (( DEBUG )) && { echo ">>> BODY (search):" >&2; echo "$BODY" | jq . >&2 || echo "$BODY" >&2; }
+
+    if (( ROWS || KV )); then
+      RESP="$(http_json_capture -X POST "$OS_URL/$OS_INDEX/_search?${QS}" --data-binary "$BODY")"
+
+      if (( ROWS )); then
+        # NDJSON : un objet JSON compact par ligne (uniquement _source filtré par includes/excludes)
+        echo "$RESP" | jq -r '.hits.hits[]._source | tojson'
+      else
+        # KV : "k=v<DELIM>k2=v2" ; ordre = --source-includes (ou keys du 1er hit si absent)
+        if [[ -n "$SRC_INCLUDES" ]]; then
+          COLS_JSON="$(jq -Rn --arg s "$SRC_INCLUDES" '$s|split(",")|map(gsub("^\\s+|\\s+$";""))')"
+        else
+          COLS_JSON="$(echo "$RESP" | jq -c 'first(.hits.hits[]._source) | (keys? // [])')"
+        fi
+        echo "$RESP" | jq -r --argjson cols "$COLS_JSON" --arg d "$DELIM" '
+          .hits.hits[]
+          | ._source as $s
+          | ($cols | if length==0 then ($s|keys) else . end)
+          | map( . + "=" + (( $s[.] )|tostring) )
+          | join($d)
+        '
+      fi
+    else
+      # Sortie JSON standard (comme avant)
+      http_json -X POST "$OS_URL/$OS_INDEX/_search?${QS}" --data-binary "$BODY"
+      echo
+    fi
+    ;;
+  *)
+    usage; exit 1;;
+esac
