@@ -25,11 +25,12 @@ CONFLICTS="abort"
 UBQ_REFRESH="true"
 
 # Search options
-SIZE=10
+SIZE=100
 FROM=0
 SORT=""
 SRC_INCLUDES=""
 SRC_EXCLUDES=""
+COUNT_ONLY=0
 
 # Sorties search “1 doc par ligne”
 ROWS=0             # --rows : NDJSON
@@ -97,6 +98,7 @@ while [[ $# -gt 0 ]]; do
     --sort) SORT="$2"; shift;;
     --source-includes|--sources-includes) SRC_INCLUDES="$2"; shift;;
     --source-excludes) SRC_EXCLUDES="$2"; shift;;
+    --count) COUNT_ONLY=1;;
     --rows) ROWS=1;;
     --kv) KV=1;;
     --delim) DELIM="$2"; shift;;
@@ -241,6 +243,10 @@ build_search_body(){
   fi
 }
 
+build_count_body(){
+  jq -n --arg q "$QSTRING" '{ query:{ query_string:{ query:$q, default_operator:"AND" } } }'
+}
+
 # --- Main ---
 QS=""; (( PRETTY )) && QS="${QS:+$QS&}pretty=true"
 
@@ -277,6 +283,16 @@ case "$MODE" in
     ;;
   search)
     [[ -z "$QSTRING" ]] && { echo "Erreur: --search nécessite -q/--query." >&2; exit 1; }
+
+    # --count : renvoyer uniquement le nombre de documents
+    if (( COUNT_ONLY )); then
+      BODY="$(build_count_body)"
+      (( DEBUG )) && { echo ">>> BODY (count):" >&2; echo "$BODY" | jq . >&2 || echo "$BODY" >&2; }
+      RESP="$(http_json_capture -X POST "$OS_URL/$OS_INDEX/_count?${QS}" --data-binary "$BODY")"
+      echo "$RESP" | jq -r '.count'
+      exit 0
+    fi
+
     BODY="$(build_search_body)"
     [[ -n "$SRC_INCLUDES" ]] && QS="${QS:+$QS&}_source_includes=$SRC_INCLUDES"
     [[ -n "$SRC_EXCLUDES" ]] && QS="${QS:+$QS&}_source_excludes=$SRC_EXCLUDES"
