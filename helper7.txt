@@ -1051,5 +1051,67 @@ show_job_stdout_no_skips() {
   '
 }
 
+-----------------------
+
+TAGS_RAW=()
+SKIP_TAGS_RAW=()
+TAGS=()
+SKIP_TAGS=()
+TAGS_CSV=""
+SKIP_TAGS_CSV=""
 
 
+    --tags)       TAGS_RAW+=("${2:?}"); shift 2 ;;
+    --skip-tags)  SKIP_TAGS_RAW+=("${2:?}"); shift 2 ;;
+-----
+normalize_csv_list -u TAGS      "${TAGS_RAW[@]}"
+normalize_csv_list -u SKIP_TAGS "${SKIP_TAGS_RAW[@]}"
+
+if ((${#TAGS[@]})); then
+  IFS=, read -r -a _ <<< "${TAGS[*]}"; TAGS_CSV="${_*}"; unset _
+  IFS=, TAGS_CSV="${TAGS[*]}"
+fi
+if ((${#SKIP_TAGS[@]})); then
+  IFS=, SKIP_TAGS_CSV="${SKIP_TAGS[*]}"
+fi
+---
+
+
+launch_template_with_inventory \
+  "${TEMPLATE_ARG}" "${INV_ID}" \
+  "${EXTRA_VARS}" "${SHOW_FAILED}" \
+  "${FAILED_DEST_NAME}" "${PURGE_DEST}" \
+  "${ORG_ID}" "${GROUP:-}" \
+  "${VERBOSE}" \
+  "${CRED_IDS[*]}" \
+  "${VERBOSITY_LEVEL}" \
+  "${TAGS_CSV}" "${SKIP_TAGS_CSV}"
+--
+
+launch_template_with_inventory \
+  "${TEMPLATE_ARG}" "${TEMP_INV_ID}" \
+  "${EXTRA_VARS}" "${SHOW_FAILED}" \
+  "${FAILED_DEST_NAME}" "${PURGE_DEST}" \
+  "${ORG_ID}" "${GROUP:-}" \
+  "${VERBOSE}" \
+  "${CRED_IDS[*]}" \
+  "${VERBOSITY_LEVEL}" \
+  "${TAGS_CSV}" "${SKIP_TAGS_CSV}"
+
+---
+launch_template_with_inventory() {
+  # ... commentaires existants ...
+  # $10 = credential IDs "12 34"
+  # $11 = verbosity level "0..5"
+  # $12 = tags_csv (ex: "tag1,tag2")
+  # $13 = skip_tags_csv (ex: "never,debug")
+  local template_arg="$1" inv_id="$2" extra_vars="$3" show_failed="$4" failed_dest="$5" purge_dest="$6" org_id="$7" dest_group="$8" verbose="${9:-false}"
+  shift 9
+  local cred_ids_ws="${1:-}"; shift || true
+  local verbosity_level="${1:-}"; shift || true
+  local tags_csv="${1:-}"; shift || true
+  local skip_tags_csv="${1:-}"
+--
+
+  [[ -n "${tags_csv}" ]]       && args+=( --tags "${tags_csv}" )
+  [[ -n "${skip_tags_csv}" ]]  && args+=( --skip_tags "${skip_tags_csv}" )
