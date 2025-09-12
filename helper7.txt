@@ -1115,3 +1115,10 @@ launch_template_with_inventory() {
 
   [[ -n "${tags_csv}" ]]       && args+=( --tags "${tags_csv}" )
   [[ -n "${skip_tags_csv}" ]]  && args+=( --skip_tags "${skip_tags_csv}" )
+
+
+
+----------
+if ((${#TAGS[@]})); then
+  ( IFS=,; TAGS_CSV="${TAGS[*]}"; printf -v TAGS_CSV '%s' "$TAGS_CSV" )
+fi
