@@ -1001,3 +1001,55 @@ show_job_stdout_no_skips() {
 }
 
 
+-----------------------------
+show_job_stdout_no_skips() {
+  # $1 = job_id
+  local job_id="${1:?usage: show_job_stdout_no_skips <job_id>}"
+
+  awx jobs stdout "${job_id}" --conf.color False </dev/null | awk '
+    BEGIN {
+      in_task = 0; keep = 0; header = ""; buf = ""
+    }
+    # Fonction pour vider la tâche en cours (imprimer seulement si non 100% skipped)
+    function flush() {
+      if (in_task) {
+        if (keep) {
+          print header
+          printf "%s", buf
+        }
+        in_task = 0; keep = 0; header = ""; buf = ""
+      }
+    }
+    # Début d une tâche
+    /^TASK \[/ {
+      flush()
+      in_task = 1; keep = 0
+      header = $0
+      next
+    }
+    # Frontières hors-tâche (nouveau PLAY, RECAP, handlers, meta, includes, etc.)
+    /^(PLAY( |$)|PLAY RECAP|RUNNING HANDLER|RUNNING HANDLERS|HANDLER \[|META:|Including:|including:|INCLUDE TASKS)/ {
+      flush()
+      print $0
+      next
+    }
+    {
+      if (in_task) {
+        # On conserve uniquement les lignes NON "skipping" (insensible à la casse)
+        if ($0 !~ /[Ss][Kk][Ii][Pp]/) {
+          keep = 1
+          buf = buf $0 ORS
+        }
+      } else {
+        # Hors tâche: on imprime tel quel
+        print $0
+      }
+    }
+    END {
+      flush()
+    }
+  '
+}
+
+
+
