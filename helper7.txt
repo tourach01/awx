@@ -1,0 +1,517 @@
+#!/usr/bin/env bash
+# aap_helpers.sh — fonctions utilitaires pour aap_load_inventory_awx.sh
+# Dépendances: bash >= 4, jq, curl, awx (recommandé mais pas obligatoire pour certaines fonctions)
+# Variables d'env possibles: URL, TOKEN (ou USER+PASS), AAP_INSECURE, BULK_BATCH_SIZE
+
+# ============================ Helpers génériques ==============================
+
+# Normalise une liste CSV passée en plusieurs arguments ("a,b" "c" ...)
+# Usage:
+#   normalize_csv_list [-u] OUTVAR INPUT1 [INPUT2 ...]
+#   -u : dédoublonne (préserve l'ordre)
+normalize_csv_list() {
+  local dedupe="false"
+  if [[ "${1:-}" == "-u" ]]; then
+    dedupe="true"; shift
+  fi
+  local -n _out="$1"; shift || true
+  _out=()
+
+  declare -A _seen=()
+  local IFS_SAVE=$IFS
+  IFS=,
+  for chunk in "$@"; do
+    for tok in $chunk; do
+      tok="${tok//$'\r'/}"
+      tok="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"$tok")"
+      [[ -z "$tok" ]] && continue
+      if [[ "$dedupe" == "true" ]]; then
+        [[ -n "${_seen[$tok]+x}" ]] && continue
+        _seen["$tok"]=1
+      fi
+      _out+=("$tok")
+    done
+  done
+  IFS=$IFS_SAVE
+}
+
+# =============================== Helpers jq ==================================
+
+first_id() {
+  jq -r '
+    if type=="array" and length>0 then
+      .[0].id // empty
+    elif type=="object" and has("results") and (.results|type=="array") and ((.results|length)>0) then
+      .results[0].id // empty
+    elif type=="object" and has("id") then
+      .id // empty
+    else empty end
+  '
+}
+
+count_items() {
+  jq -r '
+    if type=="array" then length
+    elif type=="object" and has("count") then .count
+    elif type=="object" and has("results") and (.results|type=="array") then (.results|length)
+    else 0 end
+  '
+}
+
+list_names() {
+  jq -r '
+    if type=="array" then .[]?.name
+    elif type=="object" and has("results") then .results[]?.name
+    else empty end
+  '
+}
+
+# ====================== HTTP helpers pour l'API Tower/AWX ====================
+
+# Ajoute les bons headers et passe TOUTES les options supplémentaires à curl.
+# IMPORTANT: "$@" avant l'URL pour permettre --request/--data passés par l'appelant.
+_aap_curl_json() {
+  local url="$1"; shift || true
+  local -a args=(-sS --fail --header "Content-Type: application/json")
+  [[ -n "${AAP_INSECURE:-}" ]] && args+=(-k)
+  if [[ -n "${TOKEN:-}" ]]; then
+    args+=(--header "Authorization: Bearer ${TOKEN}")
+  elif [[ -n "${USER:-}" && -n "${PASS:-}" ]]; then
+    args+=(-u "${USER}:${PASS}")
+  fi
+  curl "${args[@]}" "$@" "$url"
+}
+
+_aap_curl_post_json() {
+  local url="$1" data="$2"
+  _aap_curl_json "$url" --request POST --header "Accept: application/json" --data "$data"
+}
+
+# ======================= Inventaires / Groupes / Hôtes =======================
+
+create_inventory() {
+  # $1 = org_id, $2 = name
+  local org_id="$1" name="$2"
+  awx inventories create --name "${name}" --organization "${org_id}" -f json --conf.color False </dev/null |
+    jq -r '.id // empty'
+}
+
+ensure_group() {
+  # $1 = inventory_id, $2 = group_name
+  local inv_id="$1" group_name="$2"
+  local gid
+  gid=$(awx groups list --inventory "${inv_id}" --name "${group_name}" -f json --conf.color False </dev/null | first_id || true)
+  if [[ -z "${gid}" ]]; then
+    gid=$(awx groups create --inventory "${inv_id}" --name "${group_name}" -f json --conf.color False </dev/null | jq -r '.id // empty')
+  fi
+  printf '%s' "${gid}"
+}
+
+first_or_create_host() {
+  # (ancienne méthode non-bulk — conservée pour éventuel fallback)
+  local inv_id="$1" host="$2"
+  local hid
+  hid=$(awx hosts list --inventory "${inv_id}" --name "${host}" -f json --conf.color False </dev/null | first_id || true)
+  if [[ -z "${hid}" ]]; then
+    hid=$(awx hosts create --inventory "${inv_id}" --name "${host}" -f json --conf.color False </dev/null | jq -r '.id // empty' || true)
+  fi
+  printf '%s' "${hid}"
+}
+
+# Compte rapide des hôtes d'un inventaire via API (champ .count)
+_get_inventory_hosts_count() {
+  # $1 = inventory_id
+  local base="${URL%/}"
+  local json
+  if ! json=$(_aap_curl_json "${base}/api/v2/hosts/?inventory=$1&page_size=1"); then
+    echo 0
+    return
+  fi
+  jq -r 'if type=="object" and has("count") then .count else 0 end' <<<"$json"
+}
+
+# Associe des hôtes à un groupe, en résolvant leurs IDs par leurs noms
+_associate_hosts_to_group_by_names() {
+  # $1 = inventory_id, $2 = group_id, $3.. = noms des hôtes
+  local inv_id="$1" group_id="$2"; shift 2
+  local -a WANT_NAMES=( "$@" )
+  ((${#WANT_NAMES[@]})) || return 0
+
+  declare -A WANT=()
+  local n; for n in "${WANT_NAMES[@]}"; do WANT["$n"]=1; done
+
+  local base="${URL%/}"
+  local list_url="${base}/api/v2/hosts/?inventory=${inv_id}&page_size=200"
+  declare -A NAME2ID=()
+
+  while [[ -n "$list_url" ]]; do
+    local json
+    if ! json=$(_aap_curl_json "$list_url"); then
+      echo "Échec GET hosts inventory=${inv_id}" >&2
+      break
+    fi
+    while IFS=$'\t' read -r _id _name; do
+      [[ -z "${WANT[$_name]+x}" ]] && continue
+      NAME2ID["$_name"]="${_id}"
+    done < <(jq -r '
+      (if type=="object" and has("results") then .results else . end)
+      | .[]? | "\(.id)\t\(.name)"' <<<"$json")
+
+    list_url=$(jq -r '
+      if type=="object" and has("next") and (.next!=null) then .next else "" end
+    ' <<<"$json")
+  done
+
+  local assoc_url="${base}/api/v2/groups/${group_id}/hosts/"
+  local done_count=0 miss_count=0
+  for n in "${WANT_NAMES[@]}"; do
+    local hid="${NAME2ID[$n]:-}"
+    if [[ -z "$hid" ]]; then
+      ((miss_count++))
+      echo "  ! host '${n}' introuvable (inventaire ${inv_id})" >&2
+      continue
+    fi
+    _aap_curl_post_json "$assoc_url" "$(jq -c --argjson id "$hid" '{id:$id}')" >/dev/null || true
+    ((done_count++))
+  done
+  echo "Association groupe: ${done_count} lié(s), ${miss_count} introuvable(s)."
+}
+
+# ======================= BULK: création d'hôtes ==============================
+
+# Remplace l'ancienne add_hosts_into_inventory: envoie des lots vers /bulk/host_create/
+bulk_add_hosts_into_inventory() {
+  # $1 = inventory_id, $2 = group_id (ou vide), $3.. = liste d'hôtes
+  local inv_id="$1" group_id="${2:-}"; shift 2
+  local base="${URL%/}"
+  local bulk_url="${base}/api/v2/bulk/host_create/"
+  local batch_size="${BULK_BATCH_SIZE:-200}"
+
+  declare -A SEEN=()
+  local HOSTS=() h
+  for h in "$@"; do
+    [[ -z "$h" ]] && continue
+    [[ -n "${SEEN[$h]+x}" ]] && continue
+    SEEN["$h"]=1
+    HOSTS+=("$h")
+  done
+  ((${#HOSTS[@]})) || { echo "Aucun hôte à créer (bulk)."; return 0; }
+
+  echo "Création bulk de ${#HOSTS[@]} hôte(s) dans inventory id=${inv_id}…"
+
+  local i=0 created_total=0
+  local count_before_all
+  count_before_all=$(_get_inventory_hosts_count "$inv_id")
+
+  while (( i < ${#HOSTS[@]} )); do
+    local end=$(( i + batch_size ))
+    (( end > ${#HOSTS[@]} )) && end=${#HOSTS[@]}
+
+    local names_json payload resp
+    names_json=$(
+      printf '%s\n' "${HOSTS[@]:i:end-i}" | jq -R -s 'split("\n") | map(select(length>0))'
+    )
+    payload=$(jq -cn --argjson inv "$inv_id" --argjson names "$names_json" \
+      '{inventory:$inv, hosts: ($names | map({name:.}))}')
+
+    local count_before_batch
+    count_before_batch=$(_get_inventory_hosts_count "$inv_id")
+
+    if ! resp=$(_aap_curl_post_json "$bulk_url" "$payload"); then
+      echo "Échec bulk host_create (lot ${i}-${end})." >&2
+      return 1
+    fi
+
+    local created_this
+    created_this=$(
+      jq -r '
+        if type!="object" then 0
+        else
+          if has("created") and (.created|type=="array") then (.created|length)
+          elif has("hosts") and (.hosts|type=="object") and (.hosts|has("created")) then
+            ( .hosts.created | if type=="array" then length elif type=="number" then . else 0 end )
+          elif has("results") and (.results|type=="array") then
+            ([ .results[] | select((.created==true) or (.changed==true)) ] | length)
+          else 0 end
+        end
+      ' <<<"$resp"
+    )
+
+    if [[ -z "$created_this" || "$created_this" == "0" ]]; then
+      local count_after_batch
+      count_after_batch=$(_get_inventory_hosts_count "$inv_id")
+      local delta=$(( count_after_batch - count_before_batch ))
+      (( delta < 0 )) && delta=0
+      created_this=$delta
+    fi
+
+    (( created_total += created_this ))
+    i=$end
+  done
+
+  local count_after_all
+  count_after_all=$(_get_inventory_hosts_count "$inv_id")
+  local net_delta=$(( count_after_all - count_before_all ))
+  (( net_delta < 0 )) && net_delta=0
+
+  echo "Création bulk terminée. ${created_total} hôte(s) créés (delta inventaire: ${net_delta})."
+
+  if [[ -n "$group_id" ]]; then
+    echo "Association des hôtes au groupe id=${group_id}…"
+    _associate_hosts_to_group_by_names "$inv_id" "$group_id" "${HOSTS[@]}"
+  fi
+}
+
+# ====================== Failed hosts (summaries / events) ====================
+
+# Essai via CLI 'job_host_summaries' si dispo; sinon fallback 'job_events'
+_collect_failed_hosts_via_summaries() {
+  local job_id="$1" page=1 any=0 json
+  while :; do
+    if ! json=$(awx job_host_summaries list --job "${job_id}" --page "${page}" -f json --conf.color False </dev/null 2>/dev/null); then
+      return 1
+    fi
+    printf '%s' "${json}" | jq -r '
+      (if type=="object" and has("results") then .results else . end)
+      | .[]?
+      | select((.failed==true) or (.status=="failed") or (.failed==1))
+      | .host_name'
+    any=1
+    local has_next
+    has_next=$(printf '%s' "${json}" | jq -r 'if type=="object" and has("next") then (.next!=null) else "false" end')
+    [[ "${has_next}" == "true" ]] || break
+    ((page++))
+  done
+  [[ ${any} -eq 1 ]]
+}
+
+_collect_failed_hosts_via_events() {
+  local job_id="$1" page=1 json
+  while :; do
+    json=$(awx job_events list --job "${job_id}" \
+            --event runner_on_failed --event runner_on_unreachable \
+            --page "${page}" -f json --conf.color False </dev/null)
+    printf '%s' "${json}" | jq -r '
+      (if type=="object" and has("results") then .results else . end)
+      | .[]? | .host_name // empty'
+    local has_next
+    has_next=$(printf '%s' "${json}" | jq -r 'if type=="object" and has("next") then (.next!=null) else "false" end')
+    [[ "${has_next}" == "true" ]] || break
+    ((page++))
+  done
+}
+
+collect_failed_hosts_from_job() {
+  local job_id="$1"
+  if _collect_failed_hosts_via_summaries "${job_id}"; then
+    return 0
+  fi
+  _collect_failed_hosts_via_events "${job_id}"
+}
+
+# Variante API directe (sans CLI) — si besoin
+collect_failed_hosts_via_summaries_api() {
+  local job_id="${1:?usage: collect_failed_hosts_via_summaries_api <job_id>}"
+  local base="${URL%/}"
+  local url="${base}/api/v2/jobs/${job_id}/job_host_summaries/?page_size=200"
+  local any=0
+
+  while [[ -n "${url}" ]]; do
+    local json
+    if ! json=$(_aap_curl_json "${url}"); then
+      echo "Erreur: appel API échoué sur ${url}" >&2
+      return 1
+    fi
+    local names
+    names=$(printf '%s' "${json}" | jq -r '
+      (if type=="object" and has("results") then .results else . end)
+      | map( select((.failed==true) or (.failed==1) or (.status=="failed")) )
+      | .[] | (.host_name // (.summary_fields.host.name // empty)) | select(.!="")')
+    if [[ -n "${names}" ]]; then
+      any=1
+      printf '%s\n' "${names}"
+    fi
+    local next
+    next=$(printf '%s' "${json}" | jq -r 'if type=="object" and has("next") and (.next!=null) then .next else "" end')
+    url="${next}"
+  done
+
+  [[ ${any} -eq 1 ]] && return 0 || return 2
+}
+
+# ======================== Affichage stdout d'un job ==========================
+
+show_job_stdout() {
+  # $1 = job_id
+  local job_id="${1:?usage: show_job_stdout <job_id>}"
+  if awx jobs stdout "${job_id}" --conf.color False </dev/null; then
+    return 0
+  fi
+  local base="${URL%/}"
+  local url="${base}/api/v2/jobs/${job_id}/stdout/?format=txt_download"
+  _aap_curl_json "${url}"
+}
+
+# ===================== Extra-vars & lancement de template ====================
+
+# Génère un argument --extra_vars robuste (fichier @tmp si nécessaire)
+prepare_extra_vars_arg() {
+  local evars="$1"
+  if [[ -z "$evars" ]]; then
+    return 0
+  fi
+  if [[ "$evars" == @* ]]; then
+    local path="${evars#@}"
+    if [[ -f "$path" ]]; then
+      printf '@%s' "$path"
+      return 0
+    fi
+  fi
+  if [[ "$evars" == *$'\n'* || "$evars" == *:* || "$evars" == *"{"* ]]; then
+    local tf; tf="$(mktemp -t aap_extra_vars_XXXXXX.yml)"
+    printf '%s\n' "$evars" > "$tf"
+    printf '@%s' "$tf"
+    return 0
+  fi
+  local tf; tf="$(mktemp -t aap_extra_vars_XXXXXX.yml)"
+  {
+    for pair in $evars; do
+      local key="${pair%%=*}"
+      local val="${pair#*=}"
+      val="${val//\"/\\\"}"
+      printf '%s: "%s"\n' "$key" "$val"
+    done
+  } > "$tf"
+  printf '@%s' "$tf"
+}
+
+# Lancement d'un template, avec:
+# - contrôle verbosité (logs live ou attente silencieuse)
+# - credentials ajoutés
+# - niveau de verbosity (0..5)
+# - export des failed-hosts vers inventaire si demandé
+launch_template_with_inventory() {
+  # $1..$8 = comme avant
+  # $9  = verbose ("true"/"false")
+  # $10 = credential IDs "12 34" (peut être vide)
+  # $11 = verbosity level "0..5" (peut être vide)
+  local template_arg="$1" inv_id="$2" extra_vars="$3" show_failed="$4" failed_dest="$5" purge_dest="$6" org_id="$7" dest_group="$8" verbose="${9:-false}"
+  shift 9
+  local cred_ids_ws="${1:-}"; shift || true
+  local verbosity_level="${1:-}"
+
+  local tpl_id
+  if [[ "${template_arg}" =~ ^[0-9]+$ ]]; then
+    tpl_id="${template_arg}"
+  else
+    tpl_id=$(awx job_templates list --name "${template_arg}" -f json --conf.color False </dev/null | first_id || true)
+    [[ -z "${tpl_id}" ]] && { echo "Job Template '${template_arg}' introuvable." >&2; return 1; }
+  fi
+
+  local extra_arg=""
+  if [[ -n "${extra_vars}" ]]; then
+    extra_arg="$(prepare_extra_vars_arg "${extra_vars}")"
+  fi
+
+  local args=( job_templates launch "${tpl_id}" --inventory "${inv_id}" -f json --conf.color False )
+  [[ -n "${extra_arg}" ]] && args+=( --extra_vars "${extra_arg}" )
+
+  if [[ -n "${cred_ids_ws}" ]]; then
+    local cid
+    for cid in ${cred_ids_ws}; do
+      [[ -n "${cid}" ]] && args+=( --credential "${cid}" )
+    done
+  fi
+
+  if [[ -n "${verbosity_level}" ]]; then
+    args+=( --verbosity "${verbosity_level}" )
+  fi
+
+  local job_json job_id status
+  job_json=$(awx "${args[@]}" </dev/null)
+  job_id=$(printf '%s' "${job_json}" | jq -r '.id // empty')
+  [[ -z "${job_id}" ]] && { echo "Échec du lancement du job." >&2; printf '%s\n' "${job_json}" >&2; return 1; }
+
+  if [[ "${verbose}" == "true" ]]; then
+    echo "Job lancé: id=${job_id}. Affichage en direct…"
+    awx jobs monitor "${job_id}" --conf.color False </dev/null || true
+    status="$(awx jobs get "${job_id}" -f json --conf.color False </dev/null | jq -r '.status // empty')"
+  else
+    echo "Job lancé: id=${job_id}. Attente silencieuse de la fin…"
+    while :; do
+      status=$(awx jobs get "${job_id}" -f json --conf.color False </dev/null | jq -r '.status // empty')
+      case "$status" in
+        successful|failed|error|canceled) break ;;
+        *) sleep 2 ;;
+      esac
+    done
+  fi
+
+  local job_ok=0
+  if [[ "$status" == "successful" ]]; then
+    echo "Statut final du job ${job_id}: successful."
+  else
+    echo "Statut final du job ${job_id}: ${status}." >&2
+    job_ok=1
+  fi
+
+  if [[ "${show_failed}" == "true" ]]; then
+    echo "Hôtes en échec pour le job ${job_id}:"
+    print_failed_hosts "${job_id}"
+  fi
+
+  if [[ -n "${failed_dest}" ]]; then
+    echo "Collecte des failed-hosts du job pour alimentation de '${failed_dest}'…"
+    mapfile -t FAILED_HOSTS < <(collect_failed_hosts_from_job "${job_id}" | sort -u)
+    if ((${#FAILED_HOSTS[@]})); then
+      local dest_inv_id
+      dest_inv_id=$(awx inventories list --name "${failed_dest}" --organization "${org_id}" -f json --conf.color False </dev/null | first_id || true)
+      [[ -z "${dest_inv_id}" ]] && dest_inv_id=$(create_inventory "${org_id}" "${failed_dest}")
+      [[ "${purge_dest}" == "true" ]] && purge_inventory_hosts "${dest_inv_id}"
+      local dest_group_id=""
+      [[ -n "${dest_group}" ]] && dest_group_id=$(ensure_group "${dest_inv_id}" "${dest_group}")
+      add_hosts_into_inventory "${dest_inv_id}" "${dest_group_id}" "${FAILED_HOSTS[@]}"  # fallback per-host OK ici
+    else
+      echo "Aucun failed-host détecté pour ce job."
+    fi
+  fi
+
+  return ${job_ok}
+}
+
+# Purge des hôtes d'un inventaire (delete hosts)
+purge_inventory_hosts() {
+  local inv_id="$1"
+  echo "Purge des hôtes de l'inventaire id=${inv_id}…"
+  local page=1 deleted=0
+  while :; do
+    local json ids
+    json=$(awx hosts list --inventory "${inv_id}" --page "${page}" -f json --conf.color False </dev/null)
+    ids=$(printf '%s' "${json}" | jq -r '
+      (if type=="object" and has("results") then .results else . end)
+      | .[]? | .id')
+    [[ -z "${ids}" ]] && break
+    while IFS= read -r hid; do
+      [[ -z "${hid}" ]] && continue
+      awx hosts delete "${hid}" --conf.color False </dev/null || true
+      ((deleted++))
+    done <<< "${ids}"
+    local has_next
+    has_next=$(printf '%s' "${json}" | jq -r 'if type=="object" and has("next") then (.next!=null) else "false" end')
+    [[ "${has_next}" == "true" ]] || break
+    ((page++))
+  done
+  echo "Purge terminée: ${deleted} hôte(s) supprimé(s)."
+}
+
+# Affiche les hôtes en échec d'un job (utilise collect_failed_hosts_from_job)
+print_failed_hosts() {
+  local job_id="$1"
+  local names
+  names=$(collect_failed_hosts_from_job "${job_id}" | sort -u)
+  if [[ -n "${names}" ]]; then
+    printf '%s\n' "${names}"
+  else
+    echo "(aucun hôte en échec)"
+  fi
+}
