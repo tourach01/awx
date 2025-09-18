@@ -558,3 +558,83 @@ if [[ -n "${JT_VARS_UNSET}" ]]; then
   jt_unset_vars "${TEMPLATE_ARG}" "${JT_VARS_UNSET}" || { echo "Erreur suppression variables." >&2; exit 1; }
   exit 0
 fi
+---------------
+
+
+
+# Affiche extra_vars d'un JT, au format demandé: "yaml" | "json" | "" (auto)
+# Usage: jt_show_vars <name|id> [format]
+jt_show_vars() {
+  local tpl="${1:?usage: jt_show_vars <name|id> [yaml|json] }"
+  local fmt="${2:-}"  # "yaml" | "json" | ""
+  local tid; tid=$(resolve_template_id "$tpl") || true
+  [[ -z "$tid" ]] && { echo "Template '$tpl' introuvable." >&2; return 1; }
+
+  local raw; raw=$(jt_get_extra_vars_raw "$tid")
+
+  # helper: est-ce du JSON valide ?
+  if jq -e . >/dev/null 2>&1 <<<"$raw"; then
+    local is_json=1
+  else
+    local is_json=0
+  fi
+
+  case "$fmt" in
+    json)
+      if (( is_json )); then
+        jq . <<<"$raw"
+        return 0
+      fi
+      # YAML -> JSON : tenter yq, sinon python3+PyYAML, sinon brut
+      if command -v yq >/dev/null 2>&1; then
+        yq -o=json - <<<"$raw"
+      elif python3 - <<'PY' >/dev/null 2>&1 <<<"import yaml,sys; yaml.safe_load(sys.stdin.read())"; then
+        python3 - <<'PY' <<<"$raw"
+import sys, json
+import yaml
+print(json.dumps(yaml.safe_load(sys.stdin.read()), indent=2))
+PY
+      else
+        echo "# (extra_vars non-JSON, conversion indisponible : affiche brut)" >&2
+        printf '%s\n' "$raw"
+      fi
+      ;;
+
+    yaml)
+      if (( is_json )); then
+        # JSON -> YAML : tenter yq, sinon python3+PyYAML, sinon brut
+        if command -v yq >/dev/null 2>&1; then
+          yq -p=json -o=yaml - <<<"$raw"
+        elif python3 - <<'PY' >/dev/null 2>&1 <<<"import yaml,sys,json; yaml.safe_dump(json.loads(sys.stdin.read()))"; then
+          python3 - <<'PY' <<<"$raw"
+import sys, json, yaml
+print(yaml.safe_dump(json.loads(sys.stdin.read()), sort_keys=False))
+PY
+        else
+          echo "# (conversion JSON->YAML indisponible : affiche JSON pretty)" >&2
+          jq . <<<"$raw"
+        fi
+      else
+        # Déjà YAML : afficher tel quel
+        printf '%s\n' "$raw"
+      fi
+      ;;
+
+    ""|auto|Auto|AUTO)
+      echo "# --- extra_vars (brut) ---"
+      printf '%s\n' "$raw"
+      if (( is_json )); then
+        echo "# --- extra_vars (JSON pretty) ---"
+        jq . <<<"$raw"
+      else
+        echo "# (non-JSON : probablement YAML ; pas de pretty JSON)" >&2
+      fi
+      ;;
+
+    *)
+      echo "Format inconnu: '$fmt' (attendu: yaml|json)" >&2
+      return 2
+      ;;
+  esac
+}
+
