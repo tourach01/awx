@@ -416,3 +416,145 @@ echo "Ajout/validation des hôtes (${#FINAL_HOSTS[@]})…"
 bulk_add_hosts_into_inventory "${INV_ID}" "${GROUP_ID:-}" "${FINAL_HOSTS[@]}"
 
 echo "Terminé."
+
+
+-----------------
+helpers:
+
+# Résout l'ID d'un job template à partir d'un nom ou d'un ID
+resolve_template_id() {
+  local tpl="$1" tid=""
+  if [[ "$tpl" =~ ^[0-9]+$ ]]; then
+    tid="$tpl"
+  else
+    tid=$(awx job_templates list --name "$tpl" -f json --conf.color False </dev/null | first_id || true)
+  fi
+  [[ -n "$tid" ]] && printf '%s' "$tid"
+}
+
+# Renvoie le champ extra_vars brut (chaîne YAML/JSON) d'un JT
+jt_get_extra_vars_raw() {
+  local tpl_id="${1:?usage: jt_get_extra_vars_raw <template_id>}"
+  awx job_templates get "$tpl_id" -f json --conf.color False </dev/null | jq -r '.extra_vars // ""'
+}
+
+# Affiche extra_vars: brut + pretty JSON si possible
+jt_show_vars() {
+  local tpl="${1:?usage: jt_show_vars <name|id>}"
+  local tid; tid=$(resolve_template_id "$tpl") || true
+  [[ -z "$tid" ]] && { echo "Template '$tpl' introuvable." >&2; return 1; }
+
+  local raw; raw=$(jt_get_extra_vars_raw "$tid")
+  echo "# --- extra_vars (brut) ---"
+  printf '%s\n' "$raw"
+
+  # Tentative parse JSON
+  if jq -e . >/dev/null 2>&1 <<<"$raw"; then
+    echo "# --- extra_vars (JSON pretty) ---"
+    jq . <<<"$raw"
+  else
+    echo "# (non-JSON : probablement YAML ; pas de pretty sans parseur YAML)" >&2
+  fi
+}
+
+# Merge (ajout/remplacement) des extra_vars du JT avec un objet JSON fourni (ou @file)
+# Si l'existant n'est pas JSON: remplacement total si input = @file ; sinon erreur.
+jt_merge_vars() {
+  local tpl="${1:?usage: jt_merge_vars <name|id> <json_or_@file>}" inp="${2:?}"
+  local tid; tid=$(resolve_template_id "$tpl") || true
+  [[ -z "$tid" ]] && { echo "Template '$tpl' introuvable." >&2; return 1; }
+
+  local raw; raw=$(jt_get_extra_vars_raw "$tid")
+
+  # Charger l'input
+  local in_str=""
+  if [[ "$inp" == @* ]]; then
+    local path="${inp#@}"
+    [[ -f "$path" ]] || { echo "Fichier non trouvé: $path" >&2; return 1; }
+    in_str="$(<"$path")"
+  else
+    in_str="$inp"
+  fi
+
+  # Si l'existant est JSON -> merge. Sinon:
+  # - si input via fichier -> on remplace totalement avec --extra_vars @file
+  # - sinon -> erreur (demander un fichier)
+  if jq -e . >/dev/null 2>&1 <<<"$raw"; then
+    # Existant JSON
+    if ! jq -e . >/dev/null 2>&1 <<<"$in_str"; then
+      echo "L'input n'est pas du JSON valide. Fournis un JSON ou un fichier @vars.yml pour remplacer." >&2
+      return 1
+    fi
+    local merged
+    merged=$(jq -c --argjson base "$raw" --argjson add "$in_str" '$base + $add' <<<"null")
+    awx job_templates modify "$tid" --extra_vars "$merged" --conf.color False >/dev/null
+  else
+    # Existant non-JSON (YAML probable)
+    if [[ "$inp" == @* ]]; then
+      awx job_templates modify "$tid" --extra_vars "$inp" --conf.color False >/dev/null
+    else
+      echo "Les variables existantes ne sont pas JSON. Utilise un fichier: --jt-vars-merge @vars.yml (remplacement complet)." >&2
+      return 1
+    fi
+  fi
+  echo "OK: variables du template mises à jour."
+}
+
+# Supprime une liste de clés (JSON uniquement). Exemple: jt_unset_vars myJT "k1,k2"
+jt_unset_vars() {
+  local tpl="${1:?usage: jt_unset_vars <name|id> <key1,key2,...>}" keys_csv="${2:?}"
+  local tid; tid=$(resolve_template_id "$tpl") || true
+  [[ -z "$tid" ]] && { echo "Template '$tpl' introuvable." >&2; return 1; }
+
+  local raw; raw=$(jt_get_extra_vars_raw "$tid")
+  jq -e . >/dev/null 2>&1 <<<"$raw" || { echo "extra_vars non-JSON (YAML ?). La suppression ciblée nécessite du JSON." >&2; return 1; }
+
+  # Construire une expression jq del(.k1, .k2, ...)
+  local del_expr="."
+  local IFS=, key
+  for key in $keys_csv; do
+    key="${key//\"/\\\"}"
+    del_expr="${del_expr} | del(.\"${key}\")"
+  done
+  local updated
+  updated=$(jq -c "$del_expr" <<<"$raw")
+  awx job_templates modify "$tid" --extra_vars "$updated" --conf.color False >/dev/null
+  echo "OK: clés supprimées: ${keys_csv}"
+}
+-------------------------
+
+JT_VARS_SHOW=""
+JT_VARS_MERGE=""
+JT_VARS_UNSET=""
+----
+
+    --jt-vars-show)  JT_VARS_SHOW="${2:?}";  shift 2 ;;
+    --jt-vars-merge) JT_VARS_MERGE="${2:?}"; shift 2 ;;
+    --jt-vars-unset) JT_VARS_UNSET="${2:?}"; shift 2 ;;
+
+---
+
+# ---- Gestion des variables d'un Job Template (modes autonomes) --------------
+if [[ -n "${JT_VARS_SHOW}" ]]; then
+  jt_show_vars "${JT_VARS_SHOW}" || { echo "Erreur lecture variables." >&2; exit 1; }
+  exit 0
+fi
+
+if [[ -n "${JT_VARS_MERGE}" ]]; then
+  # Requiert aussi --template pour savoir quel JT viser
+  if [[ -z "${TEMPLATE_ARG}" ]]; then
+    echo "Erreur: --jt-vars-merge nécessite aussi --template NAME|ID (pour cibler le JT)." >&2
+    exit 1
+  fi
+  jt_merge_vars "${TEMPLATE_ARG}" "${JT_VARS_MERGE}" || { echo "Erreur merge variables." >&2; exit 1; }
+  exit 0
+fi
+
+if [[ -n "${JT_VARS_UNSET}" ]]; then
+  if [[ -z "${TEMPLATE_ARG}" ]]; then
+    echo "Erreur: --jt-vars-unset nécessite aussi --template NAME|ID (pour cibler le JT)." >&2
+    exit 1
+  fi
+  jt_unset_vars "${TEMPLATE_ARG}" "${JT_VARS_UNSET}" || { echo "Erreur suppression variables." >&2; exit 1; }
+  exit 0
+fi
