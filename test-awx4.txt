@@ -638,3 +638,19 @@ PY
   esac
 }
 
+-----------
+JT_VARS_SHOW=""
+JT_VARS_MERGE=""
+JT_VARS_UNSET=""
+JT_VARS_SHOW_FMT=""
+
+    --jt-vars-show)          JT_VARS_SHOW="${2:?}";        shift 2 ;;
+    --jt-vars-show-format)   JT_VARS_SHOW_FMT="${2:?}";    shift 2 ;;
+    --jt-vars-merge)         JT_VARS_MERGE="${2:?}";       shift 2 ;;
+    --jt-vars-unset)         JT_VARS_UNSET="${2:?}";       shift 2 ;;
+
+
+if [[ -n "${JT_VARS_SHOW}" ]]; then
+  jt_show_vars "${JT_VARS_SHOW}" "${JT_VARS_SHOW_FMT}" || { echo "Erreur lecture variables." >&2; exit 1; }
+  exit 0
+fi
