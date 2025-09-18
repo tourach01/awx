@@ -466,3 +466,75 @@ case "$MODE" in
   *)
     usage; exit 1;;
 esac
+
+
+----------------------------------------
+
+upload_file() {
+  local pattern="$1" to="$2" props="$3"
+
+  # Interdit la récursion
+  if [[ "$pattern" == *"**"* ]]; then
+    echo "ERR: pattern récursif '**' non autorisé (récursion désactivée)" >&2
+    return 1
+  fi
+
+  # Expand ~ (compgen ne l’expanse pas quand c’est dans une variable)
+  if [[ "$pattern" == "~/"* ]]; then
+    pattern="${HOME}/${pattern#~/}"
+  elif [[ "$pattern" == "~" ]]; then
+    pattern="${HOME}"
+  fi
+
+  # Essayer via compgen -G (glob). Si rien, fallback: fichier exact ?
+  mapfile -t _matches < <(compgen -G -- "$pattern" || true)
+
+  if [[ ${#_matches[@]} -eq 0 ]]; then
+    # Si le chemin correspond à un fichier exact (même sans glob), accepte-le
+    if [[ -f "$pattern" ]]; then
+      _matches=("$pattern")
+    else
+      echo "ERR: aucun fichier ne correspond au pattern: $1 (après expansion: $pattern)" >&2
+      return 1
+    fi
+  fi
+
+  # Exclure dotfiles par défaut
+  if [[ "$INCLUDE_DOTFILES" -ne 1 ]]; then
+    local filtered=() f base
+    for f in "${_matches[@]}"; do
+      base="$(basename "$f")"
+      [[ "$base" == .* ]] && continue
+      filtered+=("$f")
+    done
+    _matches=("${filtered[@]}")
+    if [[ ${#_matches[@]} -eq 0 ]]; then
+      echo "ERR: tous les fichiers correspondants sont des dotfiles (exclus par défaut)" >&2
+      return 1
+    fi
+  fi
+
+  # Plusieurs fichiers => --to doit se terminer par '/'
+  if [[ ${#_matches[@]} -gt 1 && "$to" != */ ]]; then
+    echo "ERR: plusieurs fichiers -> --to doit se terminer par '/'" >&2
+    return 1
+  fi
+
+  # Upload un ou plusieurs
+  if [[ ${#_matches[@]} -eq 1 ]]; then
+    local single="${_matches[0]}"
+    if [[ "$to" == */ ]]; then
+      upload_one "$single" "${to}$(basename "$single")" "$props"
+    else
+      upload_one "$single" "$to" "$props"
+    fi
+  else
+    local f
+    for f in "${_matches[@]}"; do
+      upload_one "$f" "${to}$(basename "$f")" "$props" || true
+    done
+  fi
+}
+
+
+
