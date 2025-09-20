@@ -804,6 +804,7 @@ jt_show_vars() {
 
 
 -------------
+-------------
 
 
 #!/usr/bin/env bash
@@ -825,6 +826,8 @@ INTERVAL_SEC="${INTERVAL_SEC:-3}"
 EXCLUDE_ADM="${EXCLUDE_ADM:-1}"          # 1 = exclut AdminServer pour ALL
 
 WLST="${WLST:-$WL_HOME/common/bin/wlst.sh}"
+# Flags WLST/JVM (optimise le démarrage). Surchargable : WLST_FLAGS=""
+WLST_FLAGS="${WLST_FLAGS:--skipWLSModuleScanning}"
 
 # ==== SANITY ===================================================
 [[ -x "$WLST" ]] || { echo "ERR: WLST introuvable: $WLST" >&2; exit 2; }
@@ -864,9 +867,7 @@ kill_force_if_alive() {
   local pid
   pid="$(get_pid "$name" || true)"
   [[ -n "${pid:-}" ]] || return 0
-  # petit délai de grâce
   sleep 2
-  # SIGKILL
   kill -9 "$pid" 2>/dev/null || true
   sleep 2
   pid="$(get_pid "$name" || true)"
@@ -880,18 +881,23 @@ _nm_run() {
   NM_HOST="$NM_HOST" NM_PORT="$NM_PORT" NM_TYPE="$NM_TYPE" \
   DOMAIN_HOME="$DOMAIN_HOME" DOMAIN_NAME="$DOMAIN_NAME" \
   NM_USER_CONFIG="$NM_USER_CONFIG" NM_USER_KEY="$NM_USER_KEY" \
-  "$WLST" <<'PY' 2>/dev/null
-from __future__ import print_function
+  bash -c '
+    # 1ère tentative : avec flags
+    if ! "'"$WLST"'" '"${WLST_FLAGS:+$WLST_FLAGS}"' <<'"PY"' 2>/dev/null; then
+      # 2ème tentative : sans flags (compat versions anciennes)
+      "'"$WLST"'" <<'"PY2"' 2>/dev/null
+    fi
+PY
 import os, sys
-host=os.environ.get('NM_HOST','localhost')
-port=int(os.environ.get('NM_PORT','5556'))
-nmtype=os.environ.get('NM_TYPE','plain')
-domdir=os.environ['DOMAIN_HOME']
-domname=os.environ.get('DOMAIN_NAME','')
-ucfg=os.environ['NM_USER_CONFIG']
-ukey=os.environ['NM_USER_KEY']
-action=os.environ['ACTION']
-server=os.environ['SERVER']
+host=os.environ.get("NM_HOST","localhost")
+port=int(os.environ.get("NM_PORT","5556"))
+nmtype=os.environ.get("NM_TYPE","plain")
+domdir=os.environ["DOMAIN_HOME"]
+domname=os.environ.get("DOMAIN_NAME","")
+ucfg=os.environ["NM_USER_CONFIG"]
+ukey=os.environ["NM_USER_KEY"]
+action=os.environ["ACTION"]
+server=os.environ["SERVER"]
 
 def _connect():
     try:
@@ -909,9 +915,9 @@ def _connect():
 def _status():
     try:
         s = nmServerStatus(server)
-        print("STATE="+str(s))
+        print "STATE="+str(s)
     except:
-        print("STATE=UNKNOWN")
+        print "STATE=UNKNOWN"
 
 def _start():
     try:
@@ -928,30 +934,89 @@ def _stop():
     _status()
 
 if not _connect():
-    print("STATE=UNKNOWN")
+    print "STATE=UNKNOWN"
     sys.exit(0)
 
-if action == 'status':
+if action == "status":
     _status()
-elif action == 'start':
+elif action == "start":
     _start()
-elif action == 'stop':
+elif action == "stop":
     _stop()
 else:
-    print("STATE=UNKNOWN")
+    print "STATE=UNKNOWN"
 PY
+import os, sys
+host=os.environ.get("NM_HOST","localhost")
+port=int(os.environ.get("NM_PORT","5556"))
+nmtype=os.environ.get("NM_TYPE","plain")
+domdir=os.environ["DOMAIN_HOME"]
+domname=os.environ.get("DOMAIN_NAME","")
+ucfg=os.environ["NM_USER_CONFIG"]
+ukey=os.environ["NM_USER_KEY"]
+action=os.environ["ACTION"]
+server=os.environ["SERVER"]
+
+def _connect():
+    try:
+        if domname:
+            nmConnect(userConfigFile=ucfg, userKeyFile=ukey,
+                      host=host, port=port, domainName=domname,
+                      domainDir=domdir, nmType=nmtype)
+        else:
+            nmConnect(userConfigFile=ucfg, userKeyFile=ukey,
+                      host=host, port=port, domainDir=domdir, nmType=nmtype)
+        return True
+    except:
+        return False
+
+def _status():
+    try:
+        s = nmServerStatus(server)
+        print "STATE="+str(s)
+    except:
+        print "STATE=UNKNOWN"
+
+def _start():
+    try:
+        nmStart(server)
+    except:
+        pass
+    _status()
+
+def _stop():
+    try:
+        nmKill(server)
+    except:
+        pass
+    _status()
+
+if not _connect():
+    print "STATE=UNKNOWN"
+    sys.exit(0)
+
+if action == "status":
+    _status()
+elif action == "start":
+    _start()
+elif action == "stop":
+    _stop()
+else:
+    print "STATE=UNKNOWN"
+PY2
+  ' >/dev/null
 }
 
 nm_state() {
   # renvoie RUNNING|SHUTDOWN|UNKNOWN
   local srv="$1"
   local line
-  line="$(_nm_run status "$srv" | awk -F= '/^STATE=/{print $2; exit}')" || true
+  line="$(_nm_run status "$srv" | awk -F= "/^STATE=/{print \$2; exit}")" || true
   echo "${line:-UNKNOWN}"
 }
 
-nm_start() { _nm_run start "$1" >/dev/null || true; }
-nm_stop()  { _nm_run stop  "$1" >/dev/null || true; }
+nm_start() { _nm_run start "$1" || true; }
+nm_stop()  { _nm_run stop  "$1" || true; }
 
 wait_for_state() {
   local srv="$1" target="$2" timeout="${3:-$TIMEOUT_SEC}" interval="${4:-$INTERVAL_SEC}"
@@ -966,7 +1031,6 @@ wait_for_state() {
     [[ "$st" == "$target" ]] && return 0
     sleep "$interval"
   done
-  # dernier état à l'écran
   [[ -n "$last" ]] || echo "$srv → UNKNOWN"
   return 1
 }
@@ -990,7 +1054,6 @@ do_stop() {
     echo "[OK] $s → SHUTDOWN"
     return 0
   fi
-  # Fallback PID (process encore vivant)
   if kill_force_if_alive "$s"; then
     echo "[OK] $s → SHUTDOWN (SIGKILL)"
     return 0
@@ -1019,7 +1082,8 @@ Requis:
 Optionnels:
   DOMAIN_NAME, NM_HOST (def=$NM_HOST), NM_PORT (def=$NM_PORT), NM_TYPE (def=$NM_TYPE),
   TIMEOUT_SEC (def=$TIMEOUT_SEC), INTERVAL_SEC (def=$INTERVAL_SEC),
-  EXCLUDE_ADM=1 (ALL n'inclut pas AdminServer)
+  EXCLUDE_ADM=1 (ALL n'inclut pas AdminServer),
+  WLST_FLAGS (defaut: -skipWLSModuleScanning)
 EOF
 }
 
@@ -1027,7 +1091,6 @@ EOF
 action="${1:-}"; target="${2:-}"
 [[ -n "$action" && -n "$target" ]] || { usage; exit 2; }
 
-# Résolution liste
 declare -a servers=()
 if [[ "$target" == "ALL" ]]; then
   mapfile -t servers < <(list_managed_servers)
@@ -1047,3 +1110,5 @@ for s in "${servers[@]}"; do
 done
 
 exit "$rc_all"
+
+
