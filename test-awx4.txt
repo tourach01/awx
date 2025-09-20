@@ -803,3 +803,247 @@ jt_show_vars() {
 
 
 
+-------------
+
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==== CONFIG REQUISE ==========================================
+: "${WL_HOME:?WL_HOME doit pointer vers $WLHOME (ex: /u01/app/oracle/middleware/wlserver)}"
+: "${DOMAIN_HOME:?DOMAIN_HOME requis (ex: /u01/domains/mydom)}"
+
+# ==== CONFIG OPTIONNELLE ======================================
+DOMAIN_NAME="${DOMAIN_NAME:-}"           # conseillé
+NM_HOST="${NM_HOST:-localhost}"
+NM_PORT="${NM_PORT:-5556}"
+NM_TYPE="${NM_TYPE:-plain}"              # plain | ssl
+NM_USER_CONFIG="${NM_USER_CONFIG:-}"     # ex: /u01/wlssec/nm.user.config
+NM_USER_KEY="${NM_USER_KEY:-}"           # ex: /u01/wlssec/nm.user.key
+TIMEOUT_SEC="${TIMEOUT_SEC:-180}"
+INTERVAL_SEC="${INTERVAL_SEC:-3}"
+EXCLUDE_ADM="${EXCLUDE_ADM:-1}"          # 1 = exclut AdminServer pour ALL
+
+WLST="${WLST:-$WL_HOME/common/bin/wlst.sh}"
+
+# ==== SANITY ===================================================
+[[ -x "$WLST" ]] || { echo "ERR: WLST introuvable: $WLST" >&2; exit 2; }
+[[ -n "$NM_USER_CONFIG" && -n "$NM_USER_KEY" ]] || { echo "ERR: NM_USER_CONFIG / NM_USER_KEY requis" >&2; exit 2; }
+
+SERVERS_DIR="${SERVERS_DIR:-$DOMAIN_HOME/servers}"
+
+# ==== UTILS ====================================================
+now(){ date '+%Y-%m-%d %H:%M:%S'; }
+
+list_managed_servers() {
+  [[ -d "$SERVERS_DIR" ]] || return 0
+  local s
+  for s in "$SERVERS_DIR"/*; do
+    [[ -d "$s" ]] || continue
+    s="${s##*/}"
+    if [[ "$EXCLUDE_ADM" == "1" && "$s" == "AdminServer" ]]; then
+      continue
+    fi
+    echo "$s"
+  done | sort
+}
+
+# Longues cmdlines -> on élargit les colonnes
+get_pid() {
+  local name="$1"
+  ps -eo pid=,cmd= --cols=5000 \
+    | grep -F 'java' \
+    | grep -F 'weblogic.Server' \
+    | grep -F "weblogic.Name=${name}" \
+    | awk '{print $1}' \
+    | head -n1
+}
+
+kill_force_if_alive() {
+  local name="$1"
+  local pid
+  pid="$(get_pid "$name" || true)"
+  [[ -n "${pid:-}" ]] || return 0
+  # petit délai de grâce
+  sleep 2
+  # SIGKILL
+  kill -9 "$pid" 2>/dev/null || true
+  sleep 2
+  pid="$(get_pid "$name" || true)"
+  [[ -z "${pid:-}" ]]
+}
+
+# ---- Mini WLST (Jython) runner: imprime toujours "STATE=<...>" ----
+_nm_run() {
+  # ACTION: status|start|stop , SERVER: nom du MS
+  ACTION="$1" SERVER="$2" \
+  NM_HOST="$NM_HOST" NM_PORT="$NM_PORT" NM_TYPE="$NM_TYPE" \
+  DOMAIN_HOME="$DOMAIN_HOME" DOMAIN_NAME="$DOMAIN_NAME" \
+  NM_USER_CONFIG="$NM_USER_CONFIG" NM_USER_KEY="$NM_USER_KEY" \
+  "$WLST" <<'PY' 2>/dev/null
+from __future__ import print_function
+import os, sys
+host=os.environ.get('NM_HOST','localhost')
+port=int(os.environ.get('NM_PORT','5556'))
+nmtype=os.environ.get('NM_TYPE','plain')
+domdir=os.environ['DOMAIN_HOME']
+domname=os.environ.get('DOMAIN_NAME','')
+ucfg=os.environ['NM_USER_CONFIG']
+ukey=os.environ['NM_USER_KEY']
+action=os.environ['ACTION']
+server=os.environ['SERVER']
+
+def _connect():
+    try:
+        if domname:
+            nmConnect(userConfigFile=ucfg, userKeyFile=ukey,
+                      host=host, port=port, domainName=domname,
+                      domainDir=domdir, nmType=nmtype)
+        else:
+            nmConnect(userConfigFile=ucfg, userKeyFile=ukey,
+                      host=host, port=port, domainDir=domdir, nmType=nmtype)
+        return True
+    except:
+        return False
+
+def _status():
+    try:
+        s = nmServerStatus(server)
+        print("STATE="+str(s))
+    except:
+        print("STATE=UNKNOWN")
+
+def _start():
+    try:
+        nmStart(server)
+    except:
+        pass
+    _status()
+
+def _stop():
+    try:
+        nmKill(server)
+    except:
+        pass
+    _status()
+
+if not _connect():
+    print("STATE=UNKNOWN")
+    sys.exit(0)
+
+if action == 'status':
+    _status()
+elif action == 'start':
+    _start()
+elif action == 'stop':
+    _stop()
+else:
+    print("STATE=UNKNOWN")
+PY
+}
+
+nm_state() {
+  # renvoie RUNNING|SHUTDOWN|UNKNOWN
+  local srv="$1"
+  local line
+  line="$(_nm_run status "$srv" | awk -F= '/^STATE=/{print $2; exit}')" || true
+  echo "${line:-UNKNOWN}"
+}
+
+nm_start() { _nm_run start "$1" >/dev/null || true; }
+nm_stop()  { _nm_run stop  "$1" >/dev/null || true; }
+
+wait_for_state() {
+  local srv="$1" target="$2" timeout="${3:-$TIMEOUT_SEC}" interval="${4:-$INTERVAL_SEC}"
+  local end=$((SECONDS + timeout))
+  local last=""
+  while (( SECONDS < end )); do
+    local st; st="$(nm_state "$srv")"
+    if [[ "$st" != "$last" ]]; then
+      echo "$srv → $st"
+      last="$st"
+    fi
+    [[ "$st" == "$target" ]] && return 0
+    sleep "$interval"
+  done
+  # dernier état à l'écran
+  [[ -n "$last" ]] || echo "$srv → UNKNOWN"
+  return 1
+}
+
+do_start() {
+  local s="$1"
+  nm_start "$s"
+  if wait_for_state "$s" "RUNNING"; then
+    echo "[OK] $s → RUNNING"
+    return 0
+  else
+    echo "[TIMEOUT] $s → démarrage non confirmé" >&2
+    return 1
+  fi
+}
+
+do_stop() {
+  local s="$1"
+  nm_stop "$s"
+  if wait_for_state "$s" "SHUTDOWN"; then
+    echo "[OK] $s → SHUTDOWN"
+    return 0
+  fi
+  # Fallback PID (process encore vivant)
+  if kill_force_if_alive "$s"; then
+    echo "[OK] $s → SHUTDOWN (SIGKILL)"
+    return 0
+  else
+    echo "[TIMEOUT] $s → arrêt non confirmé" >&2
+    return 1
+  fi
+}
+
+do_status() {
+  local s="$1"
+  local st; st="$(nm_state "$s")"
+  echo "$s → $st"
+  [[ "$st" == "RUNNING" || "$st" == "SHUTDOWN" ]]
+}
+
+usage() {
+  cat <<EOF
+Usage:
+  $(basename "$0") start  <ServerName|ALL>
+  $(basename "$0") stop   <ServerName|ALL>
+  $(basename "$0") status <ServerName|ALL>
+
+Requis:
+  WL_HOME, DOMAIN_HOME, NM_USER_CONFIG, NM_USER_KEY
+Optionnels:
+  DOMAIN_NAME, NM_HOST (def=$NM_HOST), NM_PORT (def=$NM_PORT), NM_TYPE (def=$NM_TYPE),
+  TIMEOUT_SEC (def=$TIMEOUT_SEC), INTERVAL_SEC (def=$INTERVAL_SEC),
+  EXCLUDE_ADM=1 (ALL n'inclut pas AdminServer)
+EOF
+}
+
+# ==== MAIN =====================================================
+action="${1:-}"; target="${2:-}"
+[[ -n "$action" && -n "$target" ]] || { usage; exit 2; }
+
+# Résolution liste
+declare -a servers=()
+if [[ "$target" == "ALL" ]]; then
+  mapfile -t servers < <(list_managed_servers)
+  [[ ${#servers[@]} -gt 0 ]] || { echo "INFO: aucun managed server trouvé dans $SERVERS_DIR"; exit 0; }
+else
+  servers=("$target")
+fi
+
+rc_all=0
+for s in "${servers[@]}"; do
+  case "$action" in
+    start)  do_start  "$s" || rc_all=1;;
+    stop)   do_stop   "$s" || rc_all=1;;
+    status) do_status "$s" || rc_all=1;;
+    *) usage; exit 2;;
+  esac
+done
+
+exit "$rc_all"
