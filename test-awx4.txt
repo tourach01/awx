@@ -1112,3 +1112,86 @@ done
 exit "$rc_all"
 
 
+---------------------
+---
+- name: xxxx
+  hosts: weblogic_servers
+  vars:
+    domain_home: "/u01/domains/base_domain"
+    config_xml: "{{ domain_home }}/config/config.xml"
+    nm_username: "weblogic"
+    nm_host: "localhost"
+    nm_port: "5556"
+    secure_config_file: "/u01/secure/nmUserConfig"
+    secure_key_file: "/u01/secure/nmUserKey"
+    oracle_mw_home: "/u01/oracle/middleware"
+    wlst_path: "{{ oracle_mw_home }}/oracle_common/common/bin/wlst.sh"
+
+  tasks:
+    - name: Copu script
+      copy:
+        dest: /tmp/decrypt_password.py
+        mode: '0700'
+        content: |
+          from weblogic.security.internal import SerializedSystemIni
+          from weblogic.security.internal.encryption import ClearOrEncryptedService
+          import sys
+
+          domain_home = sys.argv[1]
+          encrypted_pass = sys.argv[2]
+
+          encryption_service = SerializedSystemIni.getEncryptionService(domain_home)
+          ces = ClearOrEncryptedService(encryption_service)
+
+          clear_pass = ces.decrypt(encrypted_pass)
+          print(clear_pass)
+
+    - name: get enc pass
+      xml:
+        path: "{{ config_xml }}"
+        xpath: "/domain/security-configuration/node-manager-password-encrypted"
+        content: text
+      register: xml_password
+
+    - name: show enc pass
+      debug:
+        msg: "Mot de passe crypté trouvé : {{ xml_password.matches[0].node }}"
+
+    - name: get pass
+      shell: |
+        {{ wlst_path }} /tmp/decrypt_password.py "{{ domain_home }}" "{{ xml_password.matches[0].node }}"
+      register: decrypted_password
+      changed_when: false
+
+    - name: show pass
+      debug:
+        msg: "Mot de passe déchiffré : {{ decrypted_password.stdout }}"
+
+    - name: gen files
+      shell: |
+        cat <<EOF > /tmp/gen_securefiles.wlst
+        nmConnect('{{ nm_username }}', '{{ decrypted_password.stdout }}', '{{ nm_host }}', '{{ nm_port }}', '{{ domain_home | basename }}', '{{ domain_home }}')
+        storeUserConfig('{{ secure_config_file }}', '{{ secure_key_file }}', nm='true')
+        nmDisconnect()
+        EOF
+        {{ wlst_path }} /tmp/gen_securefiles.wlst
+      args:
+        creates: "{{ secure_config_file }}"
+
+    - name: chmod
+      file:
+        path: "{{ item }}"
+        mode: '0600'
+      loop:
+        - "{{ secure_config_file }}"
+        - "{{ secure_key_file }}"
+
+    - name: clean
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/decrypt_password.py
+        - /tmp/gen_securefiles.wlst
+
+
