@@ -1248,3 +1248,75 @@ exit "$rc_all"
     - debug:
         msg: "node-manager-password-encrypted = {{ nm_password_encrypted }}"
 
+----------
+----------
+
+- hosts: weblogic_hosts
+  gather_facts: false
+  vars:
+    wl_config: "/u01/domains/mydomain/config/config.xml"  # adapte ce chemin
+
+  tasks:
+    - name: Extraire node-manager-password-encrypted (Python stdlib, sur la cible)
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import json, os, sys, xml.etree.ElementTree as ET
+
+        path = os.environ.get("WL_CONFIG")
+        out = {"enc": "", "error": None}
+
+        try:
+            if not path or not os.path.isfile(path):
+                out["error"] = f"Config XML introuvable: {path!r}"
+            else:
+                root = ET.parse(path).getroot()
+
+                def nsless(tag):
+                    return tag.split('}', 1)[-1] if tag.startswith('{') else tag
+
+                enc = ""
+                # parcours tolérant aux namespaces
+                for child in root:
+                    if nsless(child.tag) == "security-configuration":
+                        for n in child:
+                            if nsless(n.tag) == "node-manager-password-encrypted":
+                                enc = (n.text or "").strip()
+                                break
+                        break
+
+                if enc:
+                    out["enc"] = enc
+                else:
+                    out["error"] = "Balise <node-manager-password-encrypted> absente ou vide"
+
+        except Exception as e:
+            out["error"] = f"{type(e).__name__}: {e}"
+
+        print(json.dumps(out))
+        PY
+      args:
+        executable: /bin/bash
+      environment:
+        WL_CONFIG: "{{ wl_config }}"
+      register: nm_parsed
+      changed_when: false
+
+    - name: Exposer la valeur parsée
+      ansible.builtin.set_fact:
+        nm_password_encrypted: "{{ (nm_parsed.stdout | from_json).enc | default('') }}"
+        nm_error: "{{ (nm_parsed.stdout | from_json).error | default(None) }}"
+
+    - name: Échouer proprement si la valeur est introuvable
+      ansible.builtin.assert:
+        that:
+          - nm_error is not string
+          - nm_password_encrypted | length > 0
+        fail_msg: >-
+          Extraction échouée: {{ nm_error | default('valeur vide') }}
+
+    - name: Afficher (à des fins de debug)
+      ansible.builtin.debug:
+        msg: "node-manager-password-encrypted = {{ nm_password_encrypted }}"
+
+
+
