@@ -1195,3 +1195,56 @@ exit "$rc_all"
         - /tmp/gen_securefiles.wlst
 
 
+-------------
+
+
+- hosts: weblogic_hosts
+  gather_facts: false
+  vars:
+    wl_config: "/u01/domains/mydomain/config/config.xml"
+
+  tasks:
+    - name: Récupérer le XML depuis la cible
+      slurp:
+        src: "{{ wl_config }}"
+      register: xml_raw
+
+    - name: Parser sur le contrôleur (stdlib only)
+      delegate_to: localhost
+      vars:
+        xml_text: "{{ xml_raw.content | b64decode }}"
+        parser_py: |
+          import sys, json, xml.etree.ElementTree as ET
+          data = sys.stdin.read()
+          root = ET.fromstring(data)
+
+          def nsless(tag):
+              return tag.split('}',1)[-1] if tag.startswith('{') else tag
+
+          enc = ""
+          # parcours tolérant aux namespaces par défaut
+          for child in root:
+              if nsless(child.tag) == "security-configuration":
+                  for n in child:
+                      if nsless(n.tag) == "node-manager-password-encrypted":
+                          enc = (n.text or "").strip()
+                          break
+                  break
+
+          print(json.dumps({"enc": enc}))
+      shell: |
+        python3 - <<'PY'
+        {{ parser_py }}
+        PY
+      args:
+        stdin: "{{ xml_text }}"
+      register: parsed
+
+    - name: Exposer la valeur parsée
+      set_fact:
+        nm_password_encrypted: "{{ (parsed.stdout | from_json).enc }}"
+      failed_when: (nm_password_encrypted | length) == 0
+
+    - debug:
+        msg: "node-manager-password-encrypted = {{ nm_password_encrypted }}"
+
