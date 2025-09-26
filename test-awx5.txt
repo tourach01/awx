@@ -1,0 +1,95 @@
+1- helpers
+
+# Relance un job existant.
+# $1 = job_id
+# $2 = mode: "all" (défaut) ou "failed"
+# $3 = verbose: "true"/"false"  (affiche monitor si true)
+relaunch_job() {
+  local job_id="${1:?usage: relaunch_job <job_id> [all|failed] [verbose] }"
+  local mode="${2:-all}"
+  local verbose="${3:-false}"
+
+  local base="${URL%/}"
+  local relaunch_url="${base}/api/v2/jobs/${job_id}/relaunch/"
+
+  # Optionnel: sanity check (compte des hôtes relançables)
+  local meta
+  if ! meta="$(_aap_curl_json "${relaunch_url}")"; then
+    echo "Impossible de lire les infos de relaunch pour le job ${job_id}." >&2
+    return 1
+  fi
+  if [[ "${mode}" == "failed" ]]; then
+    local can_failed
+    can_failed="$(printf '%s' "$meta" | jq -r '.retry_counts.failed // 0')"
+    if (( can_failed == 0 )); then
+      echo "Aucun hôte en échec à relancer pour le job ${job_id}." >&2
+      return 2
+    fi
+  fi
+
+  # POST relaunch
+  local payload="{}"
+  [[ "${mode}" == "failed" ]] && payload='{"hosts":"failed"}'
+
+  local created
+  if ! created="$(_aap_curl_json -X POST -H 'Content-Type: application/json' -d "$payload" "${relaunch_url}")"; then
+    echo "Échec du relaunch (mode=${mode}) pour le job ${job_id}." >&2
+    return 1
+  fi
+
+  local new_job_id
+  new_job_id="$(printf '%s' "$created" | jq -r '.id // empty')"
+  [[ -z "${new_job_id}" ]] && { echo "Relaunch: id du nouveau job introuvable." >&2; printf '%s\n' "$created" >&2; return 1; }
+
+  echo "Relaunch (mode=${mode}) déclenché: nouveau job id=${new_job_id}"
+
+  # Attente/monitor même logique que le lancement standard
+  local status
+  if [[ "${verbose}" == "true" ]]; then
+    awx jobs monitor "${new_job_id}" --conf.color False </dev/null || true
+    status="$(awx jobs get "${new_job_id}" -f json --conf.color False </dev/null | jq -r '.status // empty')"
+  else
+    while :; do
+      status="$(awx jobs get "${new_job_id}" -f json --conf.color False </dev/null | jq -r '.status // empty')"
+      case "$status" in
+        successful|failed|error|canceled) break ;;
+        *) sleep 2 ;;
+      esac
+    done
+  fi
+
+  if [[ "$status" == "successful" ]]; then
+    echo "Statut final du job ${new_job_id}: successful."
+    return 0
+  else
+    echo "Statut final du job ${new_job_id}: ${status}." >&2
+    return 1
+  fi
+}
+
+
+2- 
+
+RELAUNCH_JOB_ID=""
+RELAUNCH_MODE="all"      # all|failed
+RELAUNCH_VERBOSE="false"
+
+
+3-
+
+    -R|--relaunch)          RELAUNCH_JOB_ID="${2:?}"; shift 2 ;;
+    --relaunch-failed)      RELAUNCH_MODE="failed"; shift ;;
+    --relaunch-verbose)     RELAUNCH_VERBOSE="true"; shift ;;
+
+
+4-
+
+if [[ -n "${RELAUNCH_JOB_ID}" ]]; then
+  if ! relaunch_job "${RELAUNCH_JOB_ID}" "${RELAUNCH_MODE}" "${RELAUNCH_VERBOSE}"; then
+    exit 1
+  fi
+  exit 0
+fi
+
+
+
