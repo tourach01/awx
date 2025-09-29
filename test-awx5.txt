@@ -93,3 +93,22 @@ fi
 
 
 
+--------------------------
+def _try_connect(nmtype_local):
+    try:
+        nmConnect(userConfigFile=UCFG, userKeyFile=UKEY,
+                      host=HOST, port=PORT,
+                      domainName=DOMNAM, domainDir=DOMDIR,
+                      nmType=nmtype_local)
+        return True
+    except:
+        return False
+
+
+def _connect():
+  if _try_connect('plain'):
+    return True
+  return _try_connect('ssl')
+
+
+
