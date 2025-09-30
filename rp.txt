@@ -1,0 +1,203 @@
+
+
+
+
+sudo dnf groupinstall -y "Development Tools"
+sudo dnf install -y gcc make pkgconfig openssl-devel jemalloc-devel tcl rpmdevtools rpmlint tar
+
+rpmdev-setuptree
+export REDIS_VER=7.2.6   # adapte si besoin
+
+cd ~/rpmbuild/SOURCES
+curl -LO https://download.redis.io/releases/redis-${REDIS_VER}.tar.gz
+
+
+--------------------------------------------------
+--------------------------------------------------
+
+%global _hardened_build 1
+%define appdir /apps/install/redis
+
+Name:           redis-binaries
+Version:        %{?ver}%{!?ver:7.2.6}
+Release:        1%{?dist}
+Summary:        Redis binaries only (no users, no systemd, no config)
+License:        BSD
+URL:            https://redis.io
+Source0:        https://download.redis.io/releases/redis-%{version}.tar.gz
+
+BuildRequires:  gcc, make, pkgconfig, openssl-devel, jemalloc-devel, tcl
+# Pas de Requires: on ne déploie que des fichiers sous /apps
+
+%description
+Redis built from source. This package installs only the binaries under
+%{appdir}/bin (no users, no configs, no systemd units).
+
+%prep
+%setup -q -n redis-%{version}
+
+%build
+%set_build_flags
+# TLS + jemalloc (recommandé)
+make BUILD_TLS=yes MALLOC=jemalloc
+
+%install
+rm -rf %{buildroot}
+# Installe sous /apps/install/redis/bin
+make PREFIX=%{buildroot}%{appdir} install
+# (Optionnel) strip pour réduire la taille
+find %{buildroot}%{appdir}/bin -type f -exec %{__strip} --strip-unneeded {} \; || true
+
+%files
+%license COPYING
+%doc README* INSTALL*
+# Dossiers
+%dir %attr(0755,bin,bin) %{appdir}
+%dir %attr(0755,bin,bin) %{appdir}/bin
+# Binaries (owned by bin:bin)
+%attr(0755,bin,bin) %{appdir}/bin/redis-server
+%attr(0755,bin,bin) %{appdir}/bin/redis-cli
+%attr(0755,bin,bin) %{appdir}/bin/redis-benchmark
+%attr(0755,bin,bin) %{appdir}/bin/redis-check-aof
+%attr(0755,bin,bin) %{appdir}/bin/redis-check-rdb
+%attr(0755,bin,bin) %{appdir}/bin/redis-sentinel
+
+%changelog
+* Wed Oct 01 2025 You <you@example.com> - %{version}-1
+- Initial binaries-only build (no users, no systemd, no configs)
+
+
+
+
+----------------------------------------------------
+----------------------------------------------------
+# En tête du SPEC
+%global _hardened_build 1
+%global optflags -O3 -march=x86-64-v3 -mtune=generic -pipe -fno-plt -DNDEBUG
+%global _lto_cflags -flto=auto
+
+...
+
+%build
+# Laisse %set_build_flags appliquer le hardening standard RHEL, puis compile Redis avec nos flags
+%set_build_flags
+make BUILD_TLS=yes MALLOC=jemalloc \
+     CFLAGS="%{optflags} %{_lto_cflags}" \
+     LDFLAGS="%{_lto_cflags} -Wl,-O1 -Wl,--as-needed -Wl,-z,now -Wl,-z,relro"
+
+----------------------------------------------------------------------------------------------
+----------------------------------------------------------------------------------------------
+----------------------------------------------------------------------------------------------
+
+%global _hardened_build 1
+%define approot /apps/install/redis
+%define appdir  %{approot}/redis-%{version}
+
+# ===== Sélection du profil CPU =====
+# Utilisation: rpmbuild ... -D 'profile native'   ou   -D 'profile generic_v3'
+%{!?profile:%global profile generic_v3}
+
+# Flags par profil
+%if "%{profile}" == "native"
+  %global optflags -O3 -march=native -mtune=native -pipe -fno-plt -DNDEBUG
+%else
+  # default: generic_v3 (RHEL9: x86-64-v3 ok sur la plupart des hôtes modernes)
+  %global optflags -O3 -march=x86-64-v3 -mtune=generic -pipe -fno-plt -DNDEBUG
+%endif
+%global _lto_cflags -flto=auto
+
+Name:           redis-binaries
+Version:        %{?ver}%{!?ver:7.2.6}
+Release:        1%{?dist}
+Summary:        Redis binaries only (versioned under %{appdir} with 'current' symlink)
+License:        BSD
+URL:            https://redis.io
+Source0:        https://download.redis.io/releases/redis-%{version}.tar.gz
+
+BuildRequires:  gcc, make, pkgconfig, openssl-devel, jemalloc-devel, tcl
+
+%description
+Redis built from source. Installs only binaries under %{appdir}/bin and
+creates/updates %{approot}/current -> redis-%{version}. No users, no configs, no systemd.
+
+%prep
+%setup -q -n redis-%{version}
+
+%build
+# Durcissements RHEL puis nos flags d'optim
+%set_build_flags
+make BUILD_TLS=yes MALLOC=jemalloc \
+     CFLAGS="%{optflags} %{_lto_cflags}" \
+     LDFLAGS="%{_lto_cflags} -Wl,-O1 -Wl,--as-needed -Wl,-z,now -Wl,-z,relro" \
+     -j"$(nproc)"
+
+%install
+rm -rf %{buildroot}
+
+# Installe dans le dossier versionné
+make PREFIX=%{buildroot}%{appdir} install
+
+# Arbo + ownership
+install -d -m0755 %{buildroot}%{approot}
+chown -R bin:bin %{buildroot}%{approot}
+
+# Lien 'current' (relatif)
+ln -sfn redis-%{version} %{buildroot}%{approot}/current
+
+# Strip (réduit la taille)
+find %{buildroot}%{appdir}/bin -type f -exec %{__strip} --strip-unneeded {} \; || true
+
+%post
+# Garantit que 'current' pointe sur cette version après install/upgrade
+ln -sfn "redis-%{version}" "%{approot}/current" || true
+
+%preun
+# Si désinstallation de cette version et 'current' la visait, on le supprime
+if [ "$1" = "0" ] && [ -L "%{approot}/current" ]; then
+  if [ "x$(readlink %{approot}/current)" = "xredis-%{version}" ]; then
+    rm -f "%{approot}/current"
+  fi
+fi
+
+%files
+%license COPYING
+%doc README* INSTALL*
+
+%dir %attr(0755,bin,bin) %{approot}
+%dir %attr(0755,bin,bin) %{appdir}
+%dir %attr(0755,bin,bin) %{appdir}/bin
+%attr(0755,bin,bin) %{appdir}/bin/redis-server
+%attr(0755,bin,bin) %{appdir}/bin/redis-cli
+%attr(0755,bin,bin) %{appdir}/bin/redis-benchmark
+%attr(0755,bin,bin) %{appdir}/bin/redis-check-aof
+%attr(0755,bin,bin) %{appdir}/bin/redis-check-rdb
+%attr(0755,bin,bin) %{appdir}/bin/redis-sentinel
+%attr(-,bin,bin) %{approot}/current
+
+%changelog
+* Wed Oct 01 2025 You <you@example.com> - %{version}-1
+- Optimized binaries-only build; versioned install + 'current' symlink; CPU profile: %{profile}
+
+
+----------------------------------------------------------------------------------------------
+----------------------------------------------------------------------------------------------
+----------------------------------------------------------------------------------------------
+
+# Préparation
+sudo dnf groupinstall -y "Development Tools"
+sudo dnf install -y gcc make pkgconfig openssl-devel jemalloc-devel tcl rpmdevtools rpmlint tar
+rpmdev-setuptree
+export REDIS_VER=7.2.6
+cd ~/rpmbuild/SOURCES && curl -LO https://download.redis.io/releases/redis-${REDIS_VER}.tar.gz
+
+# 1) Build générique optimisé (x86-64-v3)
+cd ~/rpmbuild/SPECS
+rpmbuild -ba redis-binaries.spec -D "ver ${REDIS_VER}" -D 'profile generic_v3'
+
+# 2) Build “max perf” machine locale (non portable)
+rpmbuild -ba redis-binaries.spec -D "ver ${REDIS_VER}" -D 'profile native'
+
+------
+ldd /apps/install/redis/current/bin/redis-server | egrep 'ssl|crypto|jemalloc'
+
+
