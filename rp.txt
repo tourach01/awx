@@ -295,3 +295,50 @@ fi
 - Optimized binaries-only build; versioned install + 'current' symlink; CPU profile: %{profile}
 
 
+---------
+
+- hosts: all
+  gather_facts: false
+  vars:
+    base_dir: /data/toto
+
+  tasks:
+    - name: Lister les dossiers *Domain (profondeur 1)
+      ansible.builtin.find:
+        paths: "{{ base_dir }}"
+        patterns: "*Domain"
+        file_type: directory
+        recurse: false
+      register: domains
+      changed_when: false
+
+    - name: Chercher toto.txt dans chaque dossier *Domain
+      ansible.builtin.find:
+        paths: "{{ item.path }}"
+        patterns: "toto.txt"
+        file_type: file
+        recurse: true
+      loop: "{{ domains.files }}"
+      register: scans
+      changed_when: false
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Conserver seulement les dossiers qui contiennent au moins un toto.txt
+      ansible.builtin.set_fact:
+        domain_folders_abs: "{{ scans.results | selectattr('matched','>',0) | map(attribute='item.path') | list }}"
+      changed_when: false
+
+    - name: Noms simples (sans le préfixe base_dir)
+      ansible.builtin.set_fact:
+        domain_folders: >-
+          {{ domain_folders_abs
+             | map('regex_replace', '^' ~ base_dir ~ '/([^/]+)$', '\\1')
+             | list }}
+      changed_when: false
+
+    - debug:
+        msg:
+          - "Domain folders (abs):  {{ domain_folders_abs }}"
+          - "Domain folders (noms): {{ domain_folders }}"
+
