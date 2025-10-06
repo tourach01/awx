@@ -342,3 +342,94 @@ fi
           - "Domain folders (abs):  {{ domain_folders_abs }}"
           - "Domain folders (noms): {{ domain_folders }}"
 
+----------------
+
+
+
+
+
+%global _hardened_build 1
+%define approot /apps/install/redis
+%define appdir  %{approot}/redis-%{version}
+
+# ===== Profil CPU =====
+%{!?profile:%global profile generic_v3}
+
+%if "%{profile}" == "native"
+  %global optflags -O3 -march=native -mtune=native -pipe -fno-plt -DNDEBUG
+%else
+  # Par défaut : x86-64-v3 (bon compromis perf/portabilité RHEL9)
+  %global optflags -O3 -march=x86-64-v3 -mtune=generic -pipe -fno-plt -DNDEBUG
+%endif
+%global _lto_cflags -flto=auto
+
+Name:           mdw-redis
+Version:        %{?ver}%{!?ver:7.2.6}
+Release:        1%{?dist}
+Summary:        Redis binaries only (versioned under %{appdir} with 'current' symlink)
+License:        BSD
+URL:            https://redis.io
+Source0:        https://download.redis.io/releases/redis-%{version}.tar.gz
+
+BuildRequires:  gcc, make, pkgconfig, openssl-devel, tcl
+
+
+%description
+Redis built from source. Installs only the binaries under %{appdir}/bin and
+creates/updates %{approot}/current -> redis-%{version}. No users, no configs, no systemd.
+
+%prep
+%setup -q -n redis-%{version}
+
+%build
+
+%set_build_flags
+make BUILD_TLS=yes MALLOC=jemalloc \
+     CFLAGS="%{optflags} %{_lto_cflags}" \
+     LDFLAGS="%{_lto_cflags} -Wl,-O1 -Wl,--as-needed -Wl,-z,now -Wl,-z,relro" \
+     -j"$(nproc)"
+
+%install
+rm -rf %{buildroot}
+
+
+make PREFIX=%{buildroot}%{appdir} install
+
+
+install -d -m0755 %{buildroot}%{approot}
+ln -sfn redis-%{version} %{buildroot}%{approot}/current
+
+
+find %{buildroot}%{appdir}/bin -type f -exec %{__strip} --strip-unneeded {} \; || true
+
+%post
+ln -sfn "redis-%{version}" "%{approot}/current" || true
+chown -h bin:bin "%{approot}/current" || true
+
+%preun
+if [ "$1" = "0" ] && [ -L "%{approot}/current" ]; then
+  if [ "x$(readlink %{approot}/current)" = "xredis-%{version}" ]; then
+    rm -f "%{approot}/current"
+  fi
+fi
+
+%files
+%license COPYING* LICENSE*
+%doc README* INSTALL* docs/*
+
+
+%dir %attr(0755,bin,bin) %{approot}
+%dir %attr(0755,bin,bin) %{appdir}
+%dir %attr(0755,bin,bin) %{appdir}/bin
+%attr(0755,bin,bin) %{appdir}/bin/redis-server
+%attr(0755,bin,bin) %{appdir}/bin/redis-cli
+%attr(0755,bin,bin) %{appdir}/bin/redis-benchmark
+%attr(0755,bin,bin) %{appdir}/bin/redis-check-aof
+%attr(0755,bin,bin) %{appdir}/bin/redis-check-rdb
+%attr(0755,bin,bin) %{appdir}/bin/redis-sentinel
+%attr(-,bin,bin) %{approot}/current
+
+%changelog
+* Tue Oct 07 2025 You <you@example.com> - %{version}-1
+- Optimized binaries-only build; versioned install + 'current' symlink; CPU profile: %{profile}; tolerant license/doc globs
+
