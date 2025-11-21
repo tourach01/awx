@@ -1,0 +1,268 @@
+resolve_instance_group_id() {
+  local ig="${1:?usage: resolve_instance_group_id <name|id>}"
+  if [[ "$ig" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$ig"
+    return 0
+  fi
+  # lookup par nom
+  local id
+  id=$(awx instance_groups list --name "$ig" -f json --conf.color False </dev/null | jq -r '.results[0].id // empty')
+  [[ -n "$id" ]] && { printf '%s' "$id"; return 0; }
+  # fallback via API directe (au cas où)
+  id=$(_aap_curl_json "${URL%/}/api/v2/instance_groups/?name=${ig}" | jq -r '.results[0].id // empty') || true
+  [[ -n "$id" ]] && { printf '%s' "$id"; return 0; }
+  return 1
+}
+
+
+
+launch_template_with_inventory() {
+  # $1  = template_arg (id ou nom)
+  # $2  = inventory_id
+  # $3  = extra_vars string ou vide (ex: 'a=b c=d' ou '@file.yml' ou JSON/YAML inline)
+  # $4  = show_failed ("true"/"false")
+  # $5  = failed_dest_name (peut être vide)
+  # $6  = purge_dest ("true"/"false")
+  # $7  = org_id (pour créer failed_dest si besoin)
+  # $8  = dest_group (groupe optionnel de l'inventaire dest)
+  # $9  = verbose ("true"/"false") -> monitor si true, attente silencieuse sinon
+  # $10 = credential IDs "12 34" (peut être vide ; espaces séparés)
+  # $11 = verbosity level "0..5" (peut être vide)
+  # $12 = tags_csv (ex: "tag1,tag2")
+  # $13 = skip_tags_csv (ex: "never,debug")
+  # $14 = instance groups souhaités (séparés par espaces ; noms ou IDs) - peut être vide
+  local template_arg="$1" inv_id="$2" extra_vars="$3" show_failed="$4" failed_dest="$5" purge_dest="$6" org_id="$7" dest_group="$8" verbose="${9:-false}"
+  shift 9
+  local cred_ids_ws="${1:-}"; shift || true
+  local verbosity_level="${1:-}"; shift || true
+  local tags_csv="${1:-}"; shift || true
+  local skip_tags_csv="${1:-}"; shift || true
+  local ig_wanted_ws="${1:-}"
+
+  # ---- Résoudre l'ID du template
+  local tpl_id
+  if [[ "${template_arg}" =~ ^[0-9]+$ ]]; then
+    tpl_id="${template_arg}"
+  else
+    tpl_id=$(awx job_templates list --name "${template_arg}" -f json --conf.color False </dev/null | first_id || true)
+    [[ -z "${tpl_id}" ]] && { echo "Job Template '${template_arg}' introuvable." >&2; return 1; }
+  fi
+
+  # ---- Préparer --extra_vars robuste
+  local extra_arg=""
+  if [[ -n "${extra_vars}" ]]; then
+    extra_arg="$(prepare_extra_vars_arg "${extra_vars}")"
+  fi
+
+  # ---- Credentials: union + remplacement du Machine (kind=ssh)
+  local current_cred_ids
+  current_cred_ids=$(
+    awx job_templates get "${tpl_id}" -f json --conf.color False </devnull 2>/dev/null |
+    jq -r '.summary_fields.credentials[]?.id' | tr '\n' ' '
+  )
+
+  declare -a current_non_machine=() current_machine=()
+  declare -A seen_ids=()
+  local cid kind
+  for cid in ${current_cred_ids}; do
+    [[ -z "$cid" || -n "${seen_ids[$cid]+x}" ]] && continue
+    kind="$(cred_kind "$cid")"
+    if [[ "$kind" == "ssh" ]]; then current_machine+=("$cid"); else current_non_machine+=("$cid"); fi
+    seen_ids["$cid"]=1
+  done
+
+  declare -a provided_machine=() provided_non_machine=()
+  if [[ -n "${cred_ids_ws}" ]]; then
+    local pid pkind
+    for pid in ${cred_ids_ws}; do
+      [[ -z "$pid" ]] && continue
+      pkind="$(cred_kind "$pid")"
+      if [[ "$pkind" == "ssh" ]]; then provided_machine+=("$pid"); else provided_non_machine+=("$pid"); fi
+    done
+  fi
+
+  declare -a final_creds=()
+  declare -A final_seen=()
+
+  # Non-Machine : union existants + fournis
+  for cid in "${current_non_machine[@]}"; do
+    [[ -n "$cid" && -z "${final_seen[$cid]+x}" ]] && { final_creds+=("$cid"); final_seen["$cid"]=1; }
+  done
+  for cid in "${provided_non_machine[@]}"; do
+    [[ -n "$cid" && -z "${final_seen[$cid]+x}" ]] && { final_creds+=("$cid"); final_seen["$cid"]=1; }
+  done
+
+  # Machine : remplacer si fourni (prendre le 1er), sinon garder existants
+  if ((${#provided_machine[@]} > 0)); then
+    cid="${provided_machine[0]}"
+    [[ -n "$cid" && -z "${final_seen[$cid]+x}" ]] && { final_creds+=("$cid"); final_seen["$cid"]=1; }
+  else
+    for cid in "${current_machine[@]}"; do
+      [[ -n "$cid" && -z "${final_seen[$cid]+x}" ]] && { final_creds+=("$cid"); final_seen["$cid"]=1; }
+    done
+  fi
+
+  # Construire la liste CSV pour --credentials (un seul flag)
+  local creds_csv=""
+  if ((${#final_creds[@]})); then
+    local IFS=,
+    creds_csv="${final_creds[*]}"
+  fi
+
+  # ---- Instance Groups : si fournis, on lance via API /launch/
+  local ig_ids=()
+  if [[ -n "$ig_wanted_ws" ]]; then
+    local token igid
+    for token in ${ig_wanted_ws}; do
+      if igid="$(resolve_instance_group_id "$token")"; then
+        ig_ids+=("$igid")
+      else
+        echo "Avertissement: Instance Group introuvable: '$token' (ignoré)" >&2
+      fi
+    done
+  fi
+
+  if ((${#ig_ids[@]})); then
+    # Vérifier le "Prompt on launch: Instance groups"
+    local ask_igs
+    ask_igs=$(awx job_templates get "${tpl_id}" -f json --conf.color False </dev/null | jq -r '.ask_instance_groups_on_launch // false')
+    if [[ "$ask_igs" != "true" ]]; then
+      echo "Avertissement: le JT n a pas 'Prompt on launch: Instance groups' activé ; l IG demandé risque d être ignoré." >&2
+    fi
+
+    # Construire payload JSON pour /launch/
+    local ig_list_json creds_list_json payload
+    ig_list_json="$(printf '%s\n' "${ig_ids[@]}" | jq -Rsc 'split("\n")|map(select(length>0))|map(tonumber)')"
+    if [[ -n "$creds_csv" ]]; then
+      creds_list_json="$(printf '%s' "$creds_csv" | jq -R 'split(",")|map(select(length>0))|map(tonumber)')"
+    else
+      creds_list_json="[]"
+    fi
+
+    payload="$(jq -nc \
+      --arg inv   "${inv_id:-}" \
+      --arg tags  "${tags_csv:-}" \
+      --arg skips "${skip_tags_csv:-}" \
+      --arg verb  "${verbosity_level:-}" \
+      --arg ev    "${extra_arg:-}" \
+      --argjson creds "${creds_list_json}" \
+      --argjson igs   "${ig_list_json}" '
+        (if $inv  != "" then {inventory: ($inv|tonumber)} else {} end)
+        + (if $tags  != "" then {job_tags:  $tags} else {} end)
+        + (if $skips != "" then {skip_tags: $skips} else {} end)
+        + (if $verb  != "" then {verbosity: ($verb|tonumber)} else {} end)
+        + (if $ev    != "" then {extra_vars: $ev} else {} end)
+        + (if ($creds|length)>0 then {credentials: $creds} else {} end)
+        + (if ($igs|length)>0   then {instance_groups: $igs} else {} end)
+      ')"
+
+    local created job_id status
+    if ! created="$(_aap_curl_json -X POST -H 'Content-Type: application/json' -d "$payload" "${URL%/}/api/v2/job_templates/${tpl_id}/launch/")"; then
+      echo "Échec du lancement via API (avec instance_groups)." >&2
+      return 1
+    fi
+    job_id="$(printf '%s' "$created" | jq -r '.id // empty')"
+    [[ -z "$job_id" ]] && { echo "Launch API: id du job introuvable."; printf '%s\n' "$created"; return 1; }
+
+    if [[ "${verbose}" == "true" ]]; then
+      awx jobs monitor "${job_id}" --conf.color False </dev/null || true
+      status="$(awx jobs get "${job_id}" -f json --conf.color False </dev/null | jq -r '.status // empty')"
+    else
+      echo "Job lancé (API, avec Instance Groups): id=${job_id}. Attente silencieuse…"
+      while :; do
+        status=$(awx jobs get "${job_id}" -f json --conf.color False </dev/null | jq -r '.status // empty')
+        case "$status" in
+          successful|failed|error|canceled) break ;;
+          *) sleep 2 ;;
+        esac
+      done
+    fi
+
+    local job_ok=0
+    if [[ "$status" == "successful" ]]; then
+      echo "Statut final du job ${job_id}: successful."
+    else
+      echo "Statut final du job ${job_id}: ${status}." >&2
+      job_ok=1
+    fi
+
+    if [[ "${show_failed}" == "true" ]]; then
+      echo "Hôtes en échec pour le job ${job_id}:"
+      print_failed_hosts "${job_id}"
+    fi
+    if [[ -n "${failed_dest}" ]]; then
+      echo "Collecte des failed-hosts du job pour alimentation de '${failed_dest}'…"
+      mapfile -t FAILED_HOSTS < <(collect_failed_hosts_from_job "${job_id}" | sort -u)
+      if ((${#FAILED_HOSTS[@]})); then
+        local dest_inv_id dest_group_id=""
+        dest_inv_id=$(awx inventories list --name "${failed_dest}" --organization "${org_id}" -f json --conf.color False </dev/null | first_id || true)
+        [[ -z "${dest_inv_id}" ]] && dest_inv_id=$(create_inventory "${org_id}" "${failed_dest}")
+        [[ "${purge_dest}" == "true" ]] && purge_inventory_hosts "${dest_inv_id}"
+        [[ -n "${dest_group}" ]] && dest_group_id=$(ensure_group "${dest_inv_id}" "${dest_group}")
+        add_hosts_into_inventory "${dest_inv_id}" "${dest_group_id}" "${FAILED_HOSTS[@]}"
+      else
+        echo "Aucun failed-host détecté pour ce job."
+      fi
+    fi
+
+    return ${job_ok}
+  fi
+
+  # ---- Chemin CLI (pas d'Instance Group demandé)
+  local args=( job_templates launch "${tpl_id}" --inventory "${inv_id}" -f json --conf.color False )
+  [[ -n "${extra_arg}"     ]] && args+=( --extra_vars "${extra_arg}" )
+  [[ -n "${creds_csv}"     ]] && args+=( --credentials "${creds_csv}" )
+  [[ -n "${verbosity_level}" ]] && args+=( --verbosity "${verbosity_level}" )
+  [[ -n "${tags_csv}"      ]] && args+=( --tags "${tags_csv}" )
+  [[ -n "${skip_tags_csv}" ]] && args+=( --skip_tags "${skip_tags_csv}" )
+
+  local job_json job_id status
+  job_json=$(awx "${args[@]}" </dev/null)
+  job_id=$(printf '%s' "${job_json}" | jq -r '.id // empty')
+  [[ -z "${job_id}" ]] && { echo "Échec du lancement du job." >&2; printf '%s\n' "${job_json}" >&2; return 1; }
+
+  if [[ "${verbose}" == "true" ]]; then
+    echo "Job lancé: id=${job_id}. Affichage en direct…"
+    awx jobs monitor "${job_id}" --conf.color False </dev/null || true
+    status="$(awx jobs get "${job_id}" -f json --conf.color False </dev/null | jq -r '.status // empty')"
+  else
+    echo "Job lancé: id=${job_id}. Attente silencieuse de la fin…"
+    while :; do
+      status=$(awx jobs get "${job_id}" -f json --conf.color False </dev/null | jq -r '.status // empty')
+      case "$status" in
+        successful|failed|error|canceled) break ;;
+        *) sleep 2 ;;
+      esac
+    done
+  fi
+
+  local job_ok=0
+  if [[ "$status" == "successful" ]]; then
+    echo "Statut final du job ${job_id}: successful."
+  else
+    echo "Statut final du job ${job_id}: ${status}." >&2
+    job_ok=1
+  fi
+
+  if [[ "${show_failed}" == "true" ]]; then
+    echo "Hôtes en échec pour le job ${job_id}:"
+    print_failed_hosts "${job_id}"
+  fi
+
+  if [[ -n "${failed_dest}" ]]; then
+    echo "Collecte des failed-hosts du job pour alimentation de '${failed_dest}'…"
+    mapfile -t FAILED_HOSTS < <(collect_failed_hosts_from_job "${job_id}" | sort -u)
+    if ((${#FAILED_HOSTS[@]})); then
+      local dest_inv_id dest_group_id=""
+      dest_inv_id=$(awx inventories list --name "${failed_dest}" --organization "${org_id}" -f json --conf.color False </dev/null | first_id || true)
+      [[ -z "${dest_inv_id}" ]] && dest_inv_id=$(create_inventory "${org_id}" "${failed_dest}")
+      [[ "${purge_dest}" == "true" ]] && purge_inventory_hosts "${dest_inv_id}"
+      [[ -n "${dest_group}" ]] && dest_group_id=$(ensure_group "${dest_inv_id}" "${dest_group}")
+      add_hosts_into_inventory "${dest_inv_id}" "${dest_group_id}" "${FAILED_HOSTS[@]}"
+    else
+      echo "Aucun failed-host détecté pour ce job."
+    fi
+  fi
+
+  return ${job_ok}
+}
