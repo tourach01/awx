@@ -1,0 +1,24 @@
+a)
+--instance-group IG      Ajouter un Instance Group (nom ou ID). Répéter l’option pour plusieurs.
+
+b)
+INSTANCE_GROUPS_RAW=()   # valeurs telles que passées (noms ou IDs), répétables
+
+c)
+  --instance-group) INSTANCE_GROUPS_RAW+=("${2:?}"); shift 2 ;;
+  
+
+d)
+
+launch_template_with_inventory \
+  "${TEMPLATE_ARG}" "${INV_ID}" \
+  "${EXTRA_VARS}" "${SHOW_FAILED}" \
+  "${FAILED_DEST_NAME}" "${PURGE_DEST}" \
+  "${ORG_ID}" "${GROUP:-}" \
+  "${VERBOSE}" \
+  "${CRED_IDS[*]}" \
+  "${VERBOSITY_LEVEL}" \
+  "${TAGS_CSV}" "${SKIP_TAGS_CSV}" \
+  "${INSTANCE_GROUPS_RAW[*]}"
+
++ inventaire temporaire
