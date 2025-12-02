@@ -1,0 +1,14 @@
+ tasks:
+    - name: Extraire
+      ansible.builtin.shell: |
+        grep -m1 'Environment' /etc/motd | awk '{print $2}'
+      register: env_cmd
+      changed_when: false   # on ne modifie rien
+      failed_when: env_cmd.rc != 0
+
+    - name:
+      ansible.builtin.set_fact:
+        motd_environment: "{{ env_cmd.stdout | trim }}"
+
+    - debug:
+        msg: "Environment = {{ motd_environment }}"
