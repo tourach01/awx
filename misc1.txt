@@ -1,0 +1,34 @@
+- name: Parser stdout_lines -> [champ1, champ2]
+  ansible.builtin.set_fact:
+    fields12: >-
+      {{
+        cmd_out.stdout_lines
+        | reject('equalto', '')
+        | map('split')             # split sur whitespace (espaces/tabs multiples)
+        | map('slice', 0, 2)       # garde 2 premiers champs
+        | list
+      }}
+
+- name: systemctl is-active sur chaque service (champ1)
+  ansible.builtin.command: "systemctl is-active {{ item.0 }}"
+  register: svc_active
+  loop: "{{ fields12 }}"
+  loop_control:
+    label: "{{ item.0 }}"
+  changed_when: false
+  failed_when: false   # important: inactive/failed => rc != 0, on ne veut pas "failed"
+
+- name: Recomposer -> [champ1, champ2, status]
+  ansible.builtin.set_fact:
+    fields123: >-
+      {{
+        fields12
+        | zip(
+            svc_active.results
+            | map(attribute='stdout')
+            | map('default', 'unknown')
+            | list
+          )
+        | map('flatten')
+        | list
+      }}
