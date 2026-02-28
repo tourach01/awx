@@ -1,0 +1,12 @@
+Source1: openssl.cnf
+
+%global shared_openssldir /apps/install/shared/openssl
+
+%install
+install -d %{buildroot}%{shared_openssldir}
+
+install -m 0644 %{SOURCE1} %{buildroot}%{shared_openssldir}/openssl.cnf
+
+%files
+%dir %{shared_openssldir}
+%{shared_openssldir}/openssl.cnf
